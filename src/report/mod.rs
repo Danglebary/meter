@@ -5,6 +5,7 @@
 //! calls are measured section by section and rendered as text or JSON. Nothing here reads
 //! a file, the clock, or the environment, so every rule is tested against values.
 
+mod cap;
 mod carry;
 mod content;
 mod context;
@@ -18,11 +19,14 @@ mod subagents;
 mod tally;
 mod transcript;
 
+pub use cap::{CapSection, Difference, Outcome, Pickup, Simulation, cap_section};
 pub use carry::{
     CHARACTERS_PER_TOKEN, Carriage, Carried, Carry, FillSection, OutputCarry, Placed, carriage,
     fill_section,
 };
-pub use content::{IMAGE_CHARACTERS, Item, TextClass, ToolUse, class, content_characters, program};
+pub use content::{
+    IMAGE_CHARACTERS, Item, Prompt, TextClass, ToolUse, class, content_characters, program, prompt,
+};
 pub use context::{
     Band, CONTEXT_BAND_EDGES_TOKENS, ContextSection, LONG_CONTEXT_FLOOR_TOKENS, context_section,
 };
@@ -37,8 +41,8 @@ pub use render::{to_json, to_text};
 pub use sessions::{SessionSection, Spread, session_section, spread};
 pub use subagents::{Agents, SubagentSection, agent_type, subagent_section};
 pub use transcript::{
-    Call, Fold, Line, Prior, Record, SYNTHETIC_MODEL, TOKENS_PER_FIELD_MAX, Transcript, Usage,
-    read_line,
+    Call, Fold, Line, Prior, Record, SYNTHETIC_MODEL, TOKENS_PER_FIELD_MAX, Transcript, Turn,
+    Usage, read_line,
 };
 
 use jiff::Timestamp;
@@ -66,6 +70,7 @@ pub struct Report {
     pub rebuilds: RebuildSection,
     pub subagents: SubagentSection,
     pub fill: FillSection,
+    pub cap: CapSection,
 }
 
 impl Report {
@@ -77,6 +82,7 @@ impl Report {
             selection,
             transcripts,
             unread,
+            cap,
         } = gathered;
         Self {
             range,
@@ -88,18 +94,23 @@ impl Report {
             rebuilds: rebuild_section(transcripts),
             subagents: subagent_section(transcripts),
             fill: fill_section(transcripts),
+            cap: cap_section(transcripts, cap),
         }
     }
 }
 
-/// What the shell gathered for a report: the range and selection it read under, the
-/// transcripts it read, and how many selected transcripts it could not read.
+/// What the shell gathered for a report.
+///
+/// The range and selection it read under, the transcripts it read, how many selected
+/// transcripts it could not read, and the cap the context-cap simulation runs at, where one
+/// was given.
 #[derive(Debug, Clone, Copy)]
 pub struct Gathered<'a> {
     pub range: Range,
     pub selection: &'a Selection,
     pub transcripts: &'a [Transcript],
     pub unread: u64,
+    pub cap: Option<u64>,
 }
 
 /// How many sessions, subagents, and calls a report measured, what it left out, and when

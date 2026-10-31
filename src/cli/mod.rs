@@ -22,6 +22,8 @@ pub struct ReportArguments {
     pub bounds: Bounds,
     pub sessions: Vec<String>,
     pub projects: Vec<String>,
+    /// The context, in tokens, the context-cap simulation restarts a session before.
+    pub cap: Option<u64>,
     pub format: Format,
 }
 
@@ -54,6 +56,7 @@ pub enum Flag {
     Until,
     Session,
     Project,
+    Cap,
     Format,
 }
 
@@ -66,6 +69,7 @@ impl Flag {
             Self::Until => "--until",
             Self::Session => "--session",
             Self::Project => "--project",
+            Self::Cap => "--cap",
             Self::Format => "--format",
         }
     }
@@ -104,10 +108,11 @@ pub fn parse_arguments(arguments: &[String]) -> Result<Command, UsageFault> {
 }
 
 /// Parses the flags after `report`: `--since` and `--until` once each, `--session` and
-/// `--project` as often as given, and `--format` once.
+/// `--project` as often as given, and `--cap` and `--format` once each.
 fn parse_report(words: &[&str]) -> Result<ReportArguments, UsageFault> {
     let mut since = None;
     let mut until = None;
+    let mut cap = None;
     let mut format = None;
     let mut sessions = Vec::new();
     let mut projects = Vec::new();
@@ -120,13 +125,14 @@ fn parse_report(words: &[&str]) -> Result<ReportArguments, UsageFault> {
             "--until" => Flag::Until,
             "--session" => Flag::Session,
             "--project" => Flag::Project,
+            "--cap" => Flag::Cap,
             "--format" => Flag::Format,
             other => return Err(UsageFault::UnknownArgument(other.to_owned())),
         };
         let Some(value) = remaining.next() else {
             return Err(UsageFault::MissingValue(flag));
         };
-        let single = matches!(flag, Flag::Since | Flag::Until | Flag::Format);
+        let single = matches!(flag, Flag::Since | Flag::Until | Flag::Cap | Flag::Format);
         if single {
             if given.contains(&flag) {
                 return Err(UsageFault::RepeatedFlag(flag));
@@ -138,6 +144,7 @@ fn parse_report(words: &[&str]) -> Result<ReportArguments, UsageFault> {
             Flag::Until => until = Some(parse_bound(flag, value)?),
             Flag::Session => sessions.push(parse_session(value)?),
             Flag::Project => projects.push(parse_project(value)?),
+            Flag::Cap => cap = Some(parse_cap(value)?),
             Flag::Format => format = Some(parse_format(value)?),
         }
     }
@@ -145,6 +152,7 @@ fn parse_report(words: &[&str]) -> Result<ReportArguments, UsageFault> {
         bounds: Bounds { since, until },
         sessions,
         projects,
+        cap,
         format: format.unwrap_or_default(),
     })
 }
@@ -190,6 +198,20 @@ fn parse_format(value: &str) -> Result<Format, UsageFault> {
         "json" => Ok(Format::Json),
         _ => Err(UsageFault::InvalidValue(Flag::Format, value.to_owned())),
     }
+}
+
+/// A whole number of tokens above zero, written in digits alone.
+fn parse_cap(value: &str) -> Result<u64, UsageFault> {
+    // An empty value is all digits, and the parse refuses it.
+    let digits = value.chars().all(|letter| letter.is_ascii_digit());
+    if digits {
+        if let Ok(tokens) = value.parse::<u64>() {
+            if tokens > 0 {
+                return Ok(tokens);
+            }
+        }
+    }
+    Err(UsageFault::InvalidValue(Flag::Cap, value.to_owned()))
 }
 
 #[cfg(test)]

@@ -20,6 +20,7 @@ Report flags, each narrowing what is measured; with none, every transcript is:
   --until <date|timestamp>   Records at or before this. A date runs through its local end.
   --session <id>             The session and its subagents. Repeatable.
   --project <path>           The sessions started in this directory. Repeatable.
+  --cap <tokens>             Simulate restarting each main session before this context.
   --format <text|json>       The form printed; text when absent.
 
 A timestamp carries its offset: 2026-10-30T22:35:23Z or 2026-10-30T15:35:23-07:00.
@@ -48,6 +49,7 @@ const fn expected(flag: Flag) -> &'static str {
         Flag::Since | Flag::Until => "a date such as 2026-10-30 or a timestamp with its offset",
         Flag::Session => "a session id of letters, digits, and hyphens",
         Flag::Project => "a directory",
+        Flag::Cap => "a whole number of tokens above zero",
         Flag::Format => "`text` or `json`",
     }
 }

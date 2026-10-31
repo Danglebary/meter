@@ -6,6 +6,7 @@ use jiff::tz::TimeZone;
 use serde_json::{Map, Number, Value, json};
 use std::cmp::Reverse;
 
+use super::cap::{CapSection, Difference, Outcome, Pickup, Simulation};
 use super::carry::{CHARACTERS_PER_TOKEN, Carry, FillSection};
 use super::context::{Band, ContextSection, LONG_CONTEXT_FLOOR_TOKENS};
 use super::cost::{CostSection, Spend, Ttl, Writes};
@@ -14,7 +15,7 @@ use super::range::{Range, Thread};
 use super::rebuilds::{Gap, Kind, REBUILD_CONTEXT_FLOOR_TOKENS, RebuildSection};
 use super::sessions::{SessionSection, Spread};
 use super::subagents::{Agents, SubagentSection};
-use super::tally::count_one;
+use super::tally::{add, count_one};
 use super::{Measured, Report};
 
 const NANODOLLARS_PER_CENT: u128 = 10_000_000;
@@ -91,6 +92,7 @@ pub fn to_text(report: &Report, zone: &TimeZone) -> String {
         text.push_str(&rebuild_text(&report.rebuilds));
         text.push_str(&subagent_text(&report.subagents));
         text.push_str(&fill_text(&report.fill));
+        text.push_str(&cap_text(&report.cap));
     }
     text
 }
@@ -426,6 +428,7 @@ pub fn to_json(report: &Report) -> String {
         "rebuilds": rebuild_json(&report.rebuilds),
         "subagents": subagent_json(&report.subagents),
         "fill": fill_json(&report.fill),
+        "cap": cap_json(&report.cap),
     });
     let Ok(text) = serde_json::to_string_pretty(&value) else {
         unreachable!("a JSON value built from strings and numbers serializes")
@@ -953,5 +956,120 @@ fn fill_json(fill: &FillSection) -> Value {
             "tokens": integer(reads.tokens()),
             "mean_tokens": mean,
         },
+    })
+}
+
+fn cap_text(section: &CapSection) -> String {
+    let heading = match section.simulation {
+        Simulation::NoCap => "Context cap: none given; `--cap <tokens>` simulates restarting each main session through a pickup before a call would pass it.".to_owned(),
+        Simulation::NoPickupTurn { cap } => {
+            format!("Context cap at {} tokens: no restart is priced without a pickup turn.", grouped(u128::from(cap)))
+        }
+        Simulation::CapAtOrBelowPickup { cap } => format!(
+            "Context cap at {} tokens: no restart is priced, since a pickup turn ends at or above the cap.",
+            grouped(u128::from(cap))
+        ),
+        Simulation::Ran(outcome) => format!(
+            "Context cap at {} tokens: each main session restarts through a pickup before a call would pass it.",
+            grouped(u128::from(outcome.cap))
+        ),
+    };
+    let mut text = format!("\n{heading}\n");
+    text.push_str(&pickup_line(section.pickup));
+    if let Simulation::Ran(outcome) = section.simulation {
+        text.push_str(&outcome_text(&outcome));
+    }
+    text
+}
+
+fn pickup_line(pickup: Option<Pickup>) -> String {
+    let Some(pickup) = pickup else {
+        return format!("{ROW_INDENT}No pickup turn opens a main session in the range.\n");
+    };
+    format!(
+        "{ROW_INDENT}Pickup turns opening a main session: {}, a median of {} each, ending at a median of {} tokens.\n",
+        grouped(u128::from(pickup.turns)),
+        dollars(u128::from(pickup.median_nanodollars)),
+        grouped(u128::from(pickup.median_context)),
+    )
+}
+
+fn outcome_text(outcome: &Outcome) -> String {
+    let restarts_line = format!(
+        "{ROW_INDENT}Restarts: {}, in {} of {}, at {}.\n",
+        grouped(u128::from(outcome.restarts)),
+        grouped(u128::from(outcome.sessions_restarted)),
+        counted(outcome.sessions, &SESSION),
+        dollars(outcome.restart_cost),
+    );
+    let simulated = add(outcome.simulated, outcome.restart_cost);
+    let difference = match outcome.difference() {
+        Difference::Saved(saved) => vec![
+            Cell::left("saved, at most".to_owned()),
+            Cell::right(dollars(saved)),
+            Cell::right(share(Portion {
+                part: saved,
+                whole: outcome.as_run,
+            })),
+        ],
+        Difference::Added(added) => {
+            vec![Cell::left("added".to_owned()), Cell::right(dollars(added))]
+        }
+    };
+    let rows = [
+        vec![
+            Cell::left("as run".to_owned()),
+            Cell::right(dollars(outcome.as_run)),
+        ],
+        vec![
+            Cell::left("as simulated, restarts included".to_owned()),
+            Cell::right(dollars(simulated)),
+        ],
+        difference,
+    ];
+    let mut text = restarts_line;
+    text.push_str(&section("Main-thread input side under the cap", &rows));
+    text
+}
+
+fn cap_json(section: &CapSection) -> Value {
+    let pickup = section.pickup.map(|pickup| {
+        json!({
+            "turns": pickup.turns,
+            "median_usd": usd(u128::from(pickup.median_nanodollars)),
+            "median_ending_context_tokens": pickup.median_context,
+        })
+    });
+    let (outcome, cap, simulated) = match section.simulation {
+        Simulation::NoCap => ("no_cap_given", None, Value::Null),
+        Simulation::NoPickupTurn { cap } => ("no_pickup_turn", Some(cap), Value::Null),
+        Simulation::CapAtOrBelowPickup { cap } => {
+            ("cap_at_or_below_pickup_context", Some(cap), Value::Null)
+        }
+        Simulation::Ran(ran) => ("simulated", Some(ran.cap), outcome_json(&ran)),
+    };
+    json!({
+        "thread": Thread::Main.name(),
+        "cap_tokens": cap,
+        "outcome": outcome,
+        "pickup_turns": pickup,
+        "simulated": simulated,
+    })
+}
+
+fn outcome_json(outcome: &Outcome) -> Value {
+    let (saved, added) = match outcome.difference() {
+        Difference::Saved(saved) => (usd(saved), Value::Null),
+        Difference::Added(added) => (Value::Null, usd(added)),
+    };
+    json!({
+        "sessions": outcome.sessions,
+        "sessions_restarted": outcome.sessions_restarted,
+        "restarts": outcome.restarts,
+        "input_side_as_run_usd": usd(outcome.as_run),
+        "input_side_as_simulated_usd": usd(outcome.simulated),
+        "restarts_usd": usd(outcome.restart_cost),
+        "saved_at_most_usd": saved,
+        "added_usd": added,
     })
 }

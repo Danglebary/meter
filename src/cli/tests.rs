@@ -101,6 +101,8 @@ mod given_the_report_command {
             "def-2",
             "--project",
             "/home/admin/projects/meter",
+            "--cap",
+            "200000",
             "--format",
             "json",
         ];
@@ -114,6 +116,7 @@ mod given_the_report_command {
                 },
                 sessions: words(&["abc-1", "def-2"]),
                 projects: words(&["/home/admin/projects/meter"]),
+                cap: Some(200_000),
                 format: Format::Json,
             }))
         );
@@ -131,6 +134,7 @@ mod given_the_report_command {
                 Flag::Until,
             ),
             (["--format", "text", "--format", "json"], Flag::Format),
+            (["--cap", "200000", "--cap", "300000"], Flag::Cap),
         ];
 
         for (flags, flag) in rows {
@@ -160,6 +164,10 @@ mod given_the_report_command {
             (Flag::Session, "../escape"),
             (Flag::Project, ""),
             (Flag::Format, "yaml"),
+            (Flag::Cap, "0"),
+            (Flag::Cap, "200k"),
+            (Flag::Cap, "+200000"),
+            (Flag::Cap, ""),
         ];
 
         for (flag, value) in rows {
@@ -174,8 +182,8 @@ mod given_the_report_command {
     #[test]
     fn when_given_an_unknown_flag_then_it_is_refused_by_name() {
         assert_eq!(
-            parsed(&["report", "--cap", "200000"]),
-            Err(UsageFault::UnknownArgument("--cap".to_owned()))
+            parsed(&["report", "--limit", "100"]),
+            Err(UsageFault::UnknownArgument("--limit".to_owned()))
         );
     }
 }

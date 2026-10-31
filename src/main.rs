@@ -288,6 +288,7 @@ fn run_report(arguments: &ReportArguments) -> u8 {
         selection: &selection,
         transcripts: &transcripts,
         unread,
+        cap: arguments.cap,
     });
     let printed = match arguments.format {
         Format::Text => to_text(&report, &zone),

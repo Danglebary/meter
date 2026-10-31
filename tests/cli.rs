@@ -425,3 +425,76 @@ mod given_a_subagents_meta_file {
         assert_eq!(report["subagents"][0]["agents"], 1);
     }
 }
+
+mod given_a_context_cap {
+    use super::support::*;
+
+    /// An Opus 5.5 call at `at` reading `cache_read` tokens from the cache.
+    fn reading(id: &str, at: &str, cache_read: u64) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "timestamp": at,
+            "message": {
+                "id": id,
+                "model": "claude-opus-5-5",
+                "usage": { "cache_read_input_tokens": cache_read }
+            }
+        })
+        .to_string()
+    }
+
+    fn prompt(at: &str, text: &str) -> String {
+        serde_json::json!({ "type": "user", "timestamp": at, "message": { "content": text } })
+            .to_string()
+    }
+
+    /// A scratch home holding a session opening on a pickup turn that ends at 80k tokens,
+    /// and a session growing past 180k.
+    fn capped_store() -> Scratch {
+        let scratch = Scratch::new();
+        scratch.transcript(
+            "-home-p/s1.jsonl",
+            &[
+                prompt(
+                    "2026-10-30T09:00:00Z",
+                    "<command-message>pirr:pickup</command-message>\n<command-name>/pirr:pickup</command-name>",
+                ),
+                reading("p1", "2026-10-30T09:00:01Z", 80_000),
+                prompt("2026-10-30T09:01:00Z", "go on"),
+            ],
+        );
+        scratch.transcript(
+            "-home-p/s2.jsonl",
+            &[
+                prompt("2026-10-30T10:00:00Z", "hi"),
+                reading("a", "2026-10-30T10:00:01Z", 150_000),
+                reading("b", "2026-10-30T10:01:00Z", 200_000),
+            ],
+        );
+        scratch
+    }
+
+    #[test]
+    fn when_a_cap_is_given_then_a_session_passing_it_restarts_through_a_pickup() {
+        let scratch = capped_store();
+
+        let output = scratch.report(&["--cap", "180000", "--format", "json"]);
+
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["cap"]["outcome"], "simulated");
+        assert_eq!(report["cap"]["simulated"]["restarts"], 1);
+    }
+
+    #[test]
+    fn when_the_cap_is_not_a_count_of_tokens_then_it_exits_with_the_usage_code() {
+        let scratch = capped_store();
+
+        let output = scratch.report(&["--cap", "200k"]);
+
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            "meter: `--cap 200k` is not a whole number of tokens above zero; `meter --help` lists the commands\n"
+        );
+    }
+}

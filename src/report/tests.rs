@@ -559,6 +559,7 @@ mod given_a_report_to_render {
             selection: &Selection::default(),
             transcripts,
             unread: 0,
+            cap: None,
         })
     }
 
@@ -627,6 +628,9 @@ What fills the main thread's context: an item counts its characters over 4 as to
 The model's own output
   output            0.0M tokens   $0.00
   of it, thinking   0.0M tokens   $0.00
+
+Context cap: none given; `--cap <tokens>` simulates restarting each main session through a pickup before a call would pass it.
+  No pickup turn opens a main session in the range.
 "
         );
     }
@@ -1107,6 +1111,7 @@ mod given_a_user_record {
                         characters: 2,
                     },
                 ],
+                prompt: Some(Prompt::Other),
             }
         );
     }
@@ -1192,5 +1197,371 @@ mod given_items_carried_in_a_context {
         ];
 
         assert!(transcript(&lines).carriage.tools.is_empty());
+    }
+}
+
+const PICKUP_PROMPT: &str =
+    "<command-message>pirr:pickup</command-message>\n<command-name>/pirr:pickup</command-name>";
+
+/// A user record at `at` whose content is the text `text`.
+fn prompt_line(at: &str, text: &str) -> String {
+    json!({ "type": "user", "timestamp": at, "message": { "content": text } }).to_string()
+}
+
+/// An Opus 5.5 call `id` at `at` reading `cache_read` tokens from the cache.
+fn reading_line(id: &'static str, at: &'static str, cache_read: u64) -> String {
+    record(&Fixture {
+        id,
+        at,
+        model: "claude-opus-5-5",
+        usage: Usage {
+            cache_read,
+            ..Usage::default()
+        },
+    })
+}
+
+/// A compaction boundary at `at`.
+fn compaction_line(at: &str) -> String {
+    json!({ "type": "system", "subtype": "compact_boundary", "timestamp": at }).to_string()
+}
+
+/// The main thread of session `s1` folded from `lines`, in order, over `range`.
+fn folded_lines(lines: &[String], range: Range) -> Transcript {
+    let mut fold = Fold::new(range);
+    for line in lines {
+        fold.take(read_line(line));
+    }
+    fold.finish("s1".to_owned(), Thread::Main)
+}
+
+/// A main session opening on a pickup turn of two calls reading 50k and then 80k tokens
+/// from the cache, $0.026, then a typed prompt and a call reading 81k.
+fn picked_up(range: Range) -> Transcript {
+    let lines = [
+        prompt_line("2026-10-30T09:00:00Z", PICKUP_PROMPT),
+        reading_line("p1", "2026-10-30T09:00:01Z", 50_000),
+        reading_line("p2", "2026-10-30T09:00:02Z", 80_000),
+        prompt_line("2026-10-30T09:01:00Z", "go on"),
+        reading_line("p3", "2026-10-30T09:01:01Z", 81_000),
+    ];
+    folded_lines(&lines, range)
+}
+
+mod given_a_user_records_prompt {
+    use super::*;
+
+    #[test]
+    fn when_read_then_a_typed_text_or_slash_command_opens_a_turn_and_a_pickup_is_named() {
+        let rows = [
+            (json!(PICKUP_PROMPT), Some(Prompt::Pickup)),
+            (
+                json!("<command-message>x</command-message><command-name>/x</command-name>"),
+                Some(Prompt::Other),
+            ),
+            (json!("please continue"), Some(Prompt::Other)),
+            (
+                json!([{ "type": "text", "text": "<system-reminder>x</system-reminder>" }]),
+                None,
+            ),
+            (
+                json!([{ "type": "text", "text": "Base directory for this skill: /x" }]),
+                None,
+            ),
+            (
+                json!([{ "type": "tool_result", "tool_use_id": "t1", "content": "x" }]),
+                None,
+            ),
+        ];
+
+        for (content, expected) in rows {
+            let record = json!({ "type": "user", "message": { "content": content } });
+            assert_eq!(prompt(&record), expected, "{content}");
+        }
+    }
+}
+
+mod given_a_system_record {
+    use super::*;
+
+    #[test]
+    fn when_it_marks_a_compaction_boundary_then_its_time_is_read() {
+        assert_eq!(
+            read_line(&compaction_line("2026-10-30T10:00:00Z")),
+            Line::Compaction {
+                timestamp: instant("2026-10-30T10:00:00Z"),
+            }
+        );
+    }
+
+    #[test]
+    fn when_it_marks_anything_else_then_it_is_skipped() {
+        let line = json!({ "type": "system", "subtype": "api_error", "timestamp": "2026-10-30T10:00:00Z" })
+            .to_string();
+
+        assert_eq!(read_line(&line), Line::Other);
+    }
+}
+
+mod given_a_transcripts_prompts {
+    use super::*;
+
+    #[test]
+    fn when_its_first_prompt_runs_a_pickup_then_the_turn_runs_up_to_the_second_prompt() {
+        let transcript = picked_up(Range::default());
+
+        assert_eq!(
+            transcript.pickup_turn,
+            Some(Turn {
+                start: instant("2026-10-30T09:00:00Z"),
+                end: Some(instant("2026-10-30T09:01:00Z")),
+            })
+        );
+    }
+
+    #[test]
+    fn when_its_first_prompt_is_another_then_a_later_pickup_opens_no_pickup_turn() {
+        let lines = [
+            prompt_line("2026-10-30T09:00:00Z", "hello"),
+            reading_line("p1", "2026-10-30T09:00:01Z", 50_000),
+            prompt_line("2026-10-30T09:01:00Z", PICKUP_PROMPT),
+            reading_line("p2", "2026-10-30T09:01:01Z", 80_000),
+        ];
+
+        assert_eq!(folded_lines(&lines, Range::default()).pickup_turn, None);
+    }
+}
+
+mod given_a_context_cap {
+    use super::*;
+
+    const CAP_TOKENS: u64 = 180_000;
+    /// What the pickup session's calls cost on the input side, as run, all under the cap.
+    const PICKED_UP_INPUT_SIDE_NANODOLLARS: u128 = 42_200_000;
+
+    fn ran(transcripts: &[Transcript]) -> Outcome {
+        match cap_section(transcripts, Some(CAP_TOKENS)).simulation {
+            Simulation::Ran(outcome) => outcome,
+            other => panic!("the simulation ran: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn when_no_cap_is_given_then_the_pickup_turns_are_measured_and_nothing_is_simulated() {
+        let section = cap_section(&[picked_up(Range::default())], None);
+
+        assert_eq!(
+            section,
+            CapSection {
+                pickup: Some(Pickup {
+                    turns: 1,
+                    median_nanodollars: 26_000_000,
+                    median_context: 80_000,
+                }),
+                simulation: Simulation::NoCap,
+            }
+        );
+    }
+
+    #[test]
+    fn when_no_pickup_turn_opens_a_session_then_no_restart_is_priced() {
+        let section = cap_section(&[reading(&[100_000, 200_000])], Some(CAP_TOKENS));
+
+        assert_eq!(
+            section.simulation,
+            Simulation::NoPickupTurn { cap: CAP_TOKENS }
+        );
+    }
+
+    #[test]
+    fn when_the_pickup_session_began_before_the_range_then_its_turn_is_left_out() {
+        let since = Bounds {
+            since: Some(Bound::Instant(instant("2026-10-30T09:00:02Z"))),
+            until: None,
+        };
+
+        let section = cap_section(&[picked_up(range(since))], None);
+
+        assert_eq!(section.pickup, None);
+    }
+
+    #[test]
+    fn when_the_cap_is_at_or_below_the_context_a_pickup_turn_ends_at_then_no_restart_is_priced() {
+        let section = cap_section(&[picked_up(Range::default())], Some(80_000));
+
+        assert_eq!(
+            section.simulation,
+            Simulation::CapAtOrBelowPickup { cap: 80_000 }
+        );
+    }
+
+    #[test]
+    fn when_a_call_would_pass_the_cap_then_the_session_restarts_and_later_calls_keep_the_growth_since()
+     {
+        // The restart before the 200k call drops the 150k before it to the pickup's 80k,
+        // so the calls send 100k, 150k, 130k, and 180k.
+        let transcripts = [
+            picked_up(Range::default()),
+            reading(&[100_000, 150_000, 200_000, 250_000]),
+        ];
+
+        assert_eq!(
+            ran(&transcripts),
+            Outcome {
+                cap: CAP_TOKENS,
+                sessions: 2,
+                sessions_restarted: 1,
+                restarts: 1,
+                as_run: PICKED_UP_INPUT_SIDE_NANODOLLARS + 140_000_000,
+                simulated: PICKED_UP_INPUT_SIDE_NANODOLLARS + 112_000_000,
+                restart_cost: 26_000_000,
+            }
+        );
+    }
+
+    #[test]
+    fn when_a_restart_would_not_shrink_the_call_then_none_is_made() {
+        // The call before the 300k call sent less than a pickup turn leaves.
+        let outcome = ran(&[picked_up(Range::default()), reading(&[50_000, 300_000])]);
+
+        assert_eq!(outcome.restarts, 0);
+        assert_eq!(outcome.simulated, outcome.as_run);
+    }
+
+    #[test]
+    fn when_a_drop_is_taken_then_it_comes_out_of_the_cache_read_and_then_the_writes() {
+        // The 200k call reads 30k and writes 170k; the 70k drop takes the read and 40k of
+        // the write, leaving 130k written at $8 per million.
+        let rebuild = Fixture {
+            id: "c",
+            at: "2026-10-30T10:02:00Z",
+            model: "claude-opus-5-5",
+            usage: Usage {
+                cache_read: 30_000,
+                cache_write_1h: 170_000,
+                ..Usage::default()
+            },
+        };
+        let lines = [
+            reading_line("a", "2026-10-30T10:00:00Z", 100_000),
+            reading_line("b", "2026-10-30T10:01:00Z", 150_000),
+            record(&rebuild),
+        ];
+
+        let outcome = ran(&[
+            picked_up(Range::default()),
+            folded_lines(&lines, Range::default()),
+        ]);
+
+        assert_eq!(
+            outcome.simulated,
+            PICKED_UP_INPUT_SIDE_NANODOLLARS + 50_000_000 + 1_040_000_000
+        );
+    }
+
+    #[test]
+    fn when_a_later_call_sends_less_than_the_drop_leaves_then_it_keeps_the_context_a_pickup_leaves()
+    {
+        // After the restart the 120k call loses 40k of the 70k drop, sending the 80k a
+        // pickup turn leaves.
+        let outcome = ran(&[
+            picked_up(Range::default()),
+            reading(&[100_000, 150_000, 200_000, 120_000]),
+        ]);
+
+        assert_eq!(
+            outcome.simulated,
+            PICKED_UP_INPUT_SIDE_NANODOLLARS + 92_000_000
+        );
+    }
+
+    #[test]
+    fn when_a_compaction_boundary_falls_then_the_calls_after_it_carry_no_drop() {
+        // The restart before the 200k call drops 70k; after the boundary the 100k and 150k
+        // calls send what they sent.
+        let lines = [
+            reading_line("a", "2026-10-30T10:00:00Z", 100_000),
+            reading_line("b", "2026-10-30T10:01:00Z", 150_000),
+            reading_line("c", "2026-10-30T10:02:00Z", 200_000),
+            compaction_line("2026-10-30T10:02:30Z"),
+            reading_line("d", "2026-10-30T10:03:00Z", 100_000),
+            reading_line("e", "2026-10-30T10:04:00Z", 150_000),
+        ];
+
+        let outcome = ran(&[
+            picked_up(Range::default()),
+            folded_lines(&lines, Range::default()),
+        ]);
+
+        assert_eq!(outcome.restarts, 1);
+        assert_eq!(
+            outcome.simulated,
+            PICKED_UP_INPUT_SIDE_NANODOLLARS + 126_000_000
+        );
+    }
+
+    #[test]
+    fn when_rendered_then_the_text_ends_on_the_simulation_and_the_json_carries_it() {
+        let transcripts = [
+            picked_up(Range::default()),
+            reading(&[100_000, 150_000, 200_000, 250_000]),
+        ];
+        let report = Report::of(Gathered {
+            range: Range::default(),
+            selection: &Selection::default(),
+            transcripts: &transcripts,
+            unread: 0,
+            cap: Some(CAP_TOKENS),
+        });
+
+        let text = to_text(&report, &zone());
+        let value: serde_json::Value = serde_json::from_str(&to_json(&report)).unwrap();
+
+        assert!(
+            text.ends_with(
+                "
+Context cap at 180,000 tokens: each main session restarts through a pickup before a call would pass it.
+  Pickup turns opening a main session: 1, a median of $0.03 each, ending at a median of 80,000 tokens.
+  Restarts: 1, in 1 of 2 sessions, at $0.03.
+
+Main-thread input side under the cap
+  as run                            $0.18
+  as simulated, restarts included   $0.18
+  saved, at most                    $0.00   1.1%
+"
+            ),
+            "{text}"
+        );
+        assert_eq!(value["cap"]["outcome"], json!("simulated"));
+        assert_eq!(value["cap"]["simulated"]["saved_at_most_usd"], json!(0.002));
+    }
+}
+
+mod given_a_cap_outcome {
+    use super::*;
+
+    /// A cap the comparison does not read.
+    const CAP_TOKENS: u64 = 1;
+
+    #[test]
+    fn when_compared_then_the_simulated_side_and_the_restarts_together_save_or_add() {
+        let rows = [
+            (50, Difference::Saved(30)),
+            (90, Difference::Added(10)),
+            (80, Difference::Saved(0)),
+        ];
+
+        for (simulated, expected) in rows {
+            let outcome = Outcome {
+                cap: CAP_TOKENS,
+                sessions: 1,
+                sessions_restarted: 1,
+                restarts: 1,
+                as_run: 100,
+                simulated,
+                restart_cost: 20,
+            };
+            assert_eq!(outcome.difference(), expected, "{simulated}");
+        }
     }
 }

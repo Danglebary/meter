@@ -8,7 +8,7 @@ use jiff::Timestamp;
 use serde_json::Value;
 
 use super::carry::{Carriage, Carried, Placed, carriage};
-use super::content::{Item, ToolUse, attachment_item, tool_uses, user_items};
+use super::content::{Item, Prompt, ToolUse, attachment_item, prompt, tool_uses, user_items};
 use super::range::{Range, Thread};
 
 /// The model Claude Code names on the assistant records it writes itself, such as a notice
@@ -21,6 +21,8 @@ pub const TOKENS_PER_FIELD_MAX: u64 = 10_000_000;
 const USER_TYPE: &str = "\"type\":\"user\"";
 /// An attachment record holds its type in this form.
 const ATTACHMENT_TYPE: &str = "\"type\":\"attachment\"";
+/// A compaction boundary's system record holds its subtype in this form.
+const COMPACT_BOUNDARY_SUBTYPE: &str = "\"subtype\":\"compact_boundary\"";
 
 /// The tokens one call reports.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +78,12 @@ pub enum Line {
     Added {
         timestamp: Timestamp,
         items: Vec<Item>,
+        /// The turn a user record opens, where it opens one.
+        prompt: Option<Prompt>,
+    },
+    /// A compaction boundary, where Claude Code replaced the context with a summary.
+    Compaction {
+        timestamp: Timestamp,
     },
     /// Any line that is neither.
     Other,
@@ -92,7 +100,9 @@ pub fn read_line(text: &str) -> Line {
     let assistant = text.contains("\"assistant\"");
     let user = text.contains(USER_TYPE);
     let attachment = text.contains(ATTACHMENT_TYPE);
-    if !assistant && !user && !attachment {
+    let compaction = text.contains(COMPACT_BOUNDARY_SUBTYPE);
+    let read = assistant || user || attachment || compaction;
+    if !read {
         return Line::Other;
     }
     let Ok(value) = serde_json::from_str::<Value>(text) else {
@@ -100,8 +110,11 @@ pub fn read_line(text: &str) -> Line {
     };
     match value.pointer("/type").and_then(Value::as_str) {
         Some("assistant") => read_assistant(&value),
-        Some("user") => read_added(&value, user_items(&value)),
-        Some("attachment") => read_added(&value, attachment_item(&value).into_iter().collect()),
+        Some("user") => read_added(&value, user_items(&value), prompt(&value)),
+        Some("attachment") => {
+            read_added(&value, attachment_item(&value).into_iter().collect(), None)
+        }
+        Some("system") => read_compaction(&value),
         _ => Line::Other,
     }
 }
@@ -122,17 +135,38 @@ fn read_assistant(value: &Value) -> Line {
     Line::Other
 }
 
-/// A user or attachment record's `items`, placed at its time; a record adding nothing is
-/// no record the report reads.
-fn read_added(value: &Value, items: Vec<Item>) -> Line {
+/// A user or attachment record's `items` and the turn it opens, placed at its time; a
+/// record adding nothing is no record the report reads.
+fn read_added(value: &Value, items: Vec<Item>, prompt: Option<Prompt>) -> Line {
     if items.is_empty() {
+        assert!(prompt.is_none(), "a prompt adds its text to the context");
         return Line::Other;
     }
     let Ok(stamp) = text(value, "/timestamp") else {
         return Line::Malformed("/timestamp");
     };
     match stamp.parse::<Timestamp>() {
-        Ok(timestamp) => Line::Added { timestamp, items },
+        Ok(timestamp) => Line::Added {
+            timestamp,
+            items,
+            prompt,
+        },
+        Err(_) => Line::Malformed("/timestamp"),
+    }
+}
+
+/// A system record marking a compaction boundary; any other system record is no record
+/// the report reads.
+fn read_compaction(value: &Value) -> Line {
+    let boundary = value.pointer("/subtype").and_then(Value::as_str) == Some("compact_boundary");
+    if !boundary {
+        return Line::Other;
+    }
+    let Ok(stamp) = text(value, "/timestamp") else {
+        return Line::Malformed("/timestamp");
+    };
+    match stamp.parse::<Timestamp>() {
+        Ok(timestamp) => Line::Compaction { timestamp },
         Err(_) => Line::Malformed("/timestamp"),
     }
 }
@@ -220,6 +254,27 @@ pub struct Transcript {
     pub agent_type: Option<String>,
     /// What the transcript's context carried, and what its re-reads cost.
     pub carriage: Carriage,
+    /// The turn the transcript's first prompt opens, where that prompt runs `/pirr:pickup`.
+    pub pickup_turn: Option<Turn>,
+    /// When each compaction boundary the transcript records fell, earliest first.
+    pub compactions: Vec<Timestamp>,
+}
+
+/// A turn of a transcript: from its prompt up to the next prompt, where one followed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Turn {
+    pub start: Timestamp,
+    pub end: Option<Timestamp>,
+}
+
+impl Turn {
+    /// Whether a call beginning at `timestamp` falls in the turn.
+    #[must_use]
+    pub fn holds(&self, timestamp: Timestamp) -> bool {
+        let started = timestamp >= self.start;
+        let unended = self.end.is_none_or(|end| timestamp < end);
+        if started { unended } else { false }
+    }
 }
 
 /// A call outside the calls measured, kept for when it began and which model it named.
@@ -241,6 +296,10 @@ pub struct Fold {
     /// The name, and a Bash call's program, of each tool call, by its id.
     tool_names: HashMap<String, (String, Option<String>)>,
     placed: Vec<Placed>,
+    /// The transcript's first prompt, and when its second began.
+    first_prompt: Option<(Timestamp, Prompt)>,
+    second_prompt: Option<Timestamp>,
+    compactions: Vec<Timestamp>,
 }
 
 impl Fold {
@@ -254,6 +313,9 @@ impl Fold {
             before_range: None,
             tool_names: HashMap::new(),
             placed: Vec::new(),
+            first_prompt: None,
+            second_prompt: None,
+            compactions: Vec::new(),
         }
     }
 
@@ -278,13 +340,31 @@ impl Fold {
                     self.take_prior(record);
                 }
             }
-            Line::Added { timestamp, items } => {
+            Line::Added {
+                timestamp,
+                items,
+                prompt,
+            } => {
+                if let Some(prompt) = prompt {
+                    self.take_prompt(timestamp, prompt);
+                }
                 if self.range.holds(timestamp) {
                     for item in items {
                         self.place(item);
                     }
                 }
             }
+            Line::Compaction { timestamp } => self.compactions.push(timestamp),
+        }
+    }
+
+    /// Keeps the first prompt, and when the second began; later prompts open no turn the
+    /// report reads.
+    const fn take_prompt(&mut self, timestamp: Timestamp, prompt: Prompt) {
+        if self.first_prompt.is_none() {
+            self.first_prompt = Some((timestamp, prompt));
+        } else if self.second_prompt.is_none() {
+            self.second_prompt = Some(timestamp);
         }
     }
 
@@ -374,6 +454,15 @@ impl Fold {
             "the partition keeps every call"
         );
         calls.sort_by_key(|call| call.timestamp);
+        let pickup_turn = match self.first_prompt {
+            Some((start, Prompt::Pickup)) => Some(Turn {
+                start,
+                end: self.second_prompt,
+            }),
+            Some((_, Prompt::Other)) | None => None,
+        };
+        let mut compactions = self.compactions;
+        compactions.sort_unstable();
         let Ok(synthetic) = u64::try_from(synthetic.len()) else {
             unreachable!("a count of calls fits a u64")
         };
@@ -386,6 +475,8 @@ impl Fold {
             before_range: self.before_range,
             agent_type: None,
             carriage,
+            pickup_turn,
+            compactions,
         }
     }
 }

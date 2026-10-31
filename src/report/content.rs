@@ -9,6 +9,7 @@ use serde_json::Value;
 pub const IMAGE_CHARACTERS: u64 = 6_000;
 const SKILL_BODY_OPENING: &str = "Base directory for this skill";
 const SLASH_COMMAND_MARK: &str = "<command-name>";
+const PICKUP_COMMAND_MARK: &str = "<command-name>/pirr:pickup</command-name>";
 const HARNESS_OPENINGS: [&str; 3] = ["<system-reminder", "<local-command", "<task-notification"];
 const BASH_TOOL: &str = "Bash";
 const DIRECTORY_CHANGE: &str = "cd ";
@@ -62,6 +63,15 @@ impl TextClass {
             Self::Attachment(kind) => format!("attachment: {kind}"),
         }
     }
+}
+
+/// The turn a user record opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Prompt {
+    /// A prompt running `/pirr:pickup`.
+    Pickup,
+    /// Any other prompt: text the user typed, or another slash command.
+    Other,
 }
 
 /// The tool calls in an assistant record's content.
@@ -138,6 +148,36 @@ fn text_item(text: &str) -> Item {
         class: class(text),
         characters: characters(text),
     }
+}
+
+/// The prompt a user record makes, where it makes one: text the user typed or a slash
+/// command opens a turn, and harness text and skill bodies open none.
+#[must_use]
+pub fn prompt(record: &Value) -> Option<Prompt> {
+    let texts: Vec<&str> = match record.pointer("/message/content") {
+        Some(Value::String(text)) => vec![text.as_str()],
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter(|block| block.pointer("/type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|block| block.pointer("/text").and_then(Value::as_str))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let mut made = None;
+    for text in texts {
+        match class(text) {
+            TextClass::SlashCommand => {
+                if text.contains(PICKUP_COMMAND_MARK) {
+                    return Some(Prompt::Pickup);
+                }
+                made = Some(Prompt::Other);
+            }
+            TextClass::UserTyped => made = Some(Prompt::Other),
+            TextClass::SkillBody | TextClass::HarnessText => {}
+            TextClass::Attachment(_) => unreachable!("a user record's text is no attachment"),
+        }
+    }
+    made
 }
 
 /// What a piece of user-record text is, by how it opens or what it holds.
