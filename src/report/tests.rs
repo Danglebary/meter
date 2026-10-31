@@ -268,14 +268,16 @@ mod given_a_transcript_line {
 
         assert_eq!(
             read_line(&line),
-            Line::Record(Record {
-                message_id: "a".to_owned(),
-                timestamp: instant("2026-10-30T10:00:00Z"),
-                model: "claude-opus-5-5".to_owned(),
-                effort: Some("xhigh".to_owned()),
-                usage: fixture().usage,
-                tool_uses: Vec::new(),
-            })
+            Line::Record {
+                record: Record {
+                    message_id: "a".to_owned(),
+                    timestamp: instant("2026-10-30T10:00:00Z"),
+                    model: "claude-opus-5-5".to_owned(),
+                    effort: Some("xhigh".to_owned()),
+                    usage: fixture().usage,
+                },
+                tool_calls: Vec::new(),
+            }
         );
     }
 
@@ -1140,10 +1142,12 @@ mod given_a_user_record {
             Line::Added {
                 timestamp: instant("2026-10-30T10:00:00Z"),
                 items: vec![
-                    Item::ToolResult {
+                    Item::ToolResult(ToolResult {
                         tool_use_id: "t1".to_owned(),
-                        characters: 4,
-                    },
+                        is_error: false,
+                        parts: vec![ResultPart::Text("four".to_owned())],
+                        persisted_output: None,
+                    }),
                     Item::Text {
                         class: TextClass::UserTyped,
                         characters: 2,
@@ -1157,6 +1161,7 @@ mod given_a_user_record {
 
 mod given_items_carried_in_a_context {
     use super::*;
+    use claude_code_transcript::calls::CALLS_AWAITING_MAX;
 
     /// An assistant record of call `id` at `at` by `model`, calling tool `t1` where `bash`
     /// names a command.
@@ -1192,6 +1197,48 @@ mod given_items_carried_in_a_context {
             fold.take(read_line(line));
         }
         fold.finish("s1".to_owned(), Thread::Main)
+    }
+
+    /// An assistant record of call `m<index>` on 2026-10-29, calling Read under the tool id
+    /// `p<index>`.
+    fn read_call_line(index: usize) -> String {
+        json!({
+            "type": "assistant",
+            "sessionId": SESSION,
+            "timestamp": "2026-10-29T10:00:00Z",
+            "message": {
+                "id": format!("m{index}"),
+                "model": "claude-opus-5-5",
+                "content": [{ "type": "tool_use", "id": format!("p{index}"), "name": "Read", "input": {} }],
+                "usage": { "output_tokens": 10 }
+            }
+        })
+        .to_string()
+    }
+
+    /// The result of the tool call `p<index>` on 2026-10-29.
+    fn read_result_line(index: usize) -> String {
+        json!({
+            "type": "user",
+            "sessionId": SESSION,
+            "timestamp": "2026-10-29T10:00:01Z",
+            "message": { "content": [{ "type": "tool_result", "tool_use_id": format!("p{index}"), "content": "x" }] }
+        })
+        .to_string()
+    }
+
+    /// A Bash call of `git log` on 2026-10-30 returning 400 characters, then a later call.
+    fn bash_exchange() -> [String; 3] {
+        [
+            call_line(
+                "a",
+                "2026-10-30T10:00:00Z",
+                "claude-opus-5-5",
+                Some("git log"),
+            ),
+            result_line("2026-10-30T10:00:01Z", 400),
+            call_line("b", "2026-10-30T10:01:00Z", "claude-opus-5-5", None),
+        ]
     }
 
     #[test]
@@ -1237,6 +1284,51 @@ mod given_items_carried_in_a_context {
         ];
 
         assert!(transcript(&lines).carriage.tools.is_empty());
+    }
+
+    #[test]
+    fn when_a_calls_result_is_written_twice_then_the_second_is_left_out() {
+        let [call, result, later] = bash_exchange();
+        let lines = [call, result.clone(), result, later];
+
+        let carriage = transcript(&lines).carriage;
+
+        assert_eq!(carriage.tools.get("Bash").unwrap().tokens(), 100);
+    }
+
+    #[test]
+    fn when_results_fall_before_the_range_then_their_calls_await_no_longer() {
+        let mut lines = Vec::new();
+        for index in 0..CALLS_AWAITING_MAX {
+            lines.push(read_call_line(index));
+            lines.push(read_result_line(index));
+        }
+        for line in bash_exchange() {
+            lines.push(line);
+        }
+        let since = range(Bounds {
+            since: Some(Bound::Date(date(2026, 10, 30))),
+            until: None,
+        });
+
+        let carriage = folded_lines(&lines, since).carriage;
+
+        assert_eq!(carriage.tools.get("Bash").unwrap().tokens(), 100);
+    }
+
+    #[test]
+    fn when_more_calls_await_than_the_pairings_bound_then_a_later_calls_result_is_left_out() {
+        let mut lines = Vec::new();
+        for index in 0..CALLS_AWAITING_MAX {
+            lines.push(read_call_line(index));
+        }
+        for line in bash_exchange() {
+            lines.push(line);
+        }
+
+        let carriage = transcript(&lines).carriage;
+
+        assert_eq!(carriage.tools.get("Bash"), None);
     }
 }
 

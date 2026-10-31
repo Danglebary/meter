@@ -25,8 +25,7 @@ pub use carry::{
     fill_section,
 };
 pub use content::{
-    IMAGE_CHARACTERS, Item, Prompt, TextClass, ToolUse, content_characters, program, prompt,
-    text_class,
+    IMAGE_CHARACTERS, Item, Prompt, TextClass, content_characters, program, prompt, text_class,
 };
 pub use context::{
     Band, CONTEXT_BAND_EDGES_TOKENS, ContextSection, LONG_CONTEXT_FLOOR_TOKENS, context_section,
