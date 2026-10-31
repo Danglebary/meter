@@ -9,6 +9,14 @@ use jiff::civil::date;
 use jiff::tz::{TimeZone, offset};
 use serde_json::json;
 
+use claude_code_transcript::record::{
+    ResultPart, TOKENS_PER_FIELD_MAX, ToolResult, UserBlock, class_of,
+};
+use claude_code_transcript::store::AgentType;
+
+/// The session every record a case builds names.
+const SESSION: &str = "s1";
+
 fn zone() -> TimeZone {
     TimeZone::fixed(offset(-7))
 }
@@ -37,11 +45,13 @@ fn record(fixture: &Fixture) -> String {
         .unwrap();
     json!({
         "type": "assistant",
+        "sessionId": SESSION,
         "timestamp": fixture.at,
         "effort": "xhigh",
         "message": {
             "id": fixture.id,
             "model": fixture.model,
+            "content": [],
             "usage": {
                 "input_tokens": usage.input,
                 "cache_read_input_tokens": usage.cache_read,
@@ -233,26 +243,6 @@ mod given_a_transcript_location {
     }
 }
 
-mod given_a_project_path {
-    use super::*;
-
-    #[test]
-    fn when_encoded_then_every_character_but_letters_and_digits_becomes_a_hyphen() {
-        let rows = [
-            ("/home/admin/projects/meter", "-home-admin-projects-meter"),
-            (
-                "/tmp/claude-1001/-opt-homelab",
-                "-tmp-claude-1001--opt-homelab",
-            ),
-            ("/home/admin/.claude", "-home-admin--claude"),
-        ];
-
-        for (path, directory) in rows {
-            assert_eq!(project_directory(path), directory, "{path}");
-        }
-    }
-}
-
 mod given_a_transcript_line {
     use super::*;
 
@@ -293,9 +283,7 @@ mod given_a_transcript_line {
     fn when_it_holds_no_record_the_report_reads_then_it_is_skipped() {
         let rows = [
             json!({ "type": "summary", "summary": "the assistant and the user" }).to_string(),
-            json!({ "type": "user", "timestamp": "2026-10-30T10:00:00Z", "message": { "content": [] } }).to_string(),
-            json!({ "type": "assistant", "message": { "id": "a", "model": "m" } }).to_string(),
-            json!({ "type": "assistant", "message": { "model": "m", "usage": {} } }).to_string(),
+            json!({ "type": "user", "sessionId": SESSION, "timestamp": "2026-10-30T10:00:00Z", "message": { "content": [] } }).to_string(),
             "not json".to_owned(),
         ];
 
@@ -308,6 +296,9 @@ mod given_a_transcript_line {
     fn when_a_field_fails_its_check_then_the_record_names_that_field() {
         let above_bound = TOKENS_PER_FIELD_MAX.checked_add(1).unwrap();
         let rows = [
+            ("/sessionId", json!("")),
+            ("/message/id", json!(null)),
+            ("/message/usage", json!(null)),
             ("/message/usage/input_tokens", json!("1")),
             ("/message/usage/output_tokens", json!(-1)),
             ("/message/usage/cache_read_input_tokens", json!(above_bound)),
@@ -998,17 +989,20 @@ mod given_a_subagents_meta_file {
     use super::*;
 
     #[test]
-    fn when_it_names_a_type_then_that_type_is_read_and_otherwise_none() {
+    fn when_it_names_a_type_then_that_type_is_kept_and_otherwise_none() {
         let rows = [
-            (r#"{"agentType":"Explore","spawnDepth":1}"#, Some("Explore")),
-            (r#"{"agentType":""}"#, None),
-            (r#"{"agentType":3}"#, None),
-            ("{}", None),
-            ("not json", None),
+            (AgentType::Named("Explore".to_owned()), Some("Explore")),
+            (AgentType::Unnamed, None),
+            (AgentType::NoMeta, None),
+            (AgentType::Malformed, None),
+            (
+                AgentType::Unread(std::io::ErrorKind::PermissionDenied),
+                None,
+            ),
         ];
 
-        for (meta, name) in rows {
-            assert_eq!(agent_type(meta).as_deref(), name, "{meta}");
+        for (read, name) in rows {
+            assert_eq!(agent_type(&read).as_deref(), name, "{read:?}");
         }
     }
 }
@@ -1087,7 +1081,7 @@ mod given_a_user_record {
     use super::*;
 
     #[test]
-    fn when_its_text_is_classed_then_its_opening_or_mark_decides() {
+    fn when_its_text_is_classed_then_typed_text_and_a_shell_command_alone_count_as_typed() {
         let rows = [
             ("Base directory for this skill: /x", TextClass::SkillBody),
             (
@@ -1099,35 +1093,40 @@ mod given_a_user_record {
                 TextClass::HarnessText,
             ),
             ("<task-notification>x", TextClass::HarnessText),
+            ("<local-command-stdout>x", TextClass::HarnessText),
+            ("[Request interrupted by user]", TextClass::HarnessText),
+            ("<bash-stdout>x</bash-stdout>", TextClass::HarnessText),
+            ("<bash-input>ls</bash-input>", TextClass::UserTyped),
             ("please continue", TextClass::UserTyped),
         ];
 
         for (text, expected) in rows {
-            assert_eq!(class(text), expected, "{text}");
+            assert_eq!(text_class(&class_of(text)), expected, "{text}");
         }
     }
 
     #[test]
-    fn when_a_tool_results_content_is_measured_then_each_block_counts_by_its_type() {
-        let content = json!([
-            { "type": "text", "text": "héllo" },
-            { "type": "image", "source": {} },
-            { "type": "other" }
-        ]);
+    fn when_a_tool_results_content_is_measured_then_each_part_counts_by_its_type() {
+        let parts = [
+            ResultPart::Text("héllo".to_owned()),
+            ResultPart::Image,
+            ResultPart::Other(json!({ "type": "other" })),
+        ];
 
         let other = json!({ "type": "other" }).to_string().chars().count();
         let expected = 5_u64
             .checked_add(IMAGE_CHARACTERS)
             .and_then(|sum| sum.checked_add(u64::try_from(other).unwrap()))
             .unwrap();
-        assert_eq!(content_characters(&content), expected);
-        assert_eq!(content_characters(&json!("héllo")), 5);
+        assert_eq!(content_characters(&parts), expected);
+        assert_eq!(content_characters(&[]), 0);
     }
 
     #[test]
     fn when_read_then_its_tool_results_and_text_are_its_items() {
         let line = json!({
             "type": "user",
+            "sessionId": SESSION,
             "timestamp": "2026-10-30T10:00:00Z",
             "message": { "content": [
                 { "type": "tool_result", "tool_use_id": "t1", "content": "four" },
@@ -1170,6 +1169,7 @@ mod given_items_carried_in_a_context {
         };
         json!({
             "type": "assistant",
+            "sessionId": SESSION,
             "timestamp": at,
             "message": { "id": id, "model": model, "content": content, "usage": { "output_tokens": 10 } }
         })
@@ -1179,6 +1179,7 @@ mod given_items_carried_in_a_context {
     fn result_line(at: &str, characters: usize) -> String {
         json!({
             "type": "user",
+            "sessionId": SESSION,
             "timestamp": at,
             "message": { "content": [{ "type": "tool_result", "tool_use_id": "t1", "content": "x".repeat(characters) }] }
         })
@@ -1244,7 +1245,8 @@ const PICKUP_PROMPT: &str =
 
 /// A user record at `at` whose content is the text `text`.
 fn prompt_line(at: &str, text: &str) -> String {
-    json!({ "type": "user", "timestamp": at, "message": { "content": text } }).to_string()
+    json!({ "type": "user", "sessionId": SESSION, "timestamp": at, "message": { "content": text } })
+        .to_string()
 }
 
 /// An Opus 5.5 call `id` at `at` reading `cache_read` tokens from the cache.
@@ -1262,7 +1264,8 @@ fn reading_line(id: &'static str, at: &'static str, cache_read: u64) -> String {
 
 /// A compaction boundary at `at`.
 fn compaction_line(at: &str) -> String {
-    json!({ "type": "system", "subtype": "compact_boundary", "timestamp": at }).to_string()
+    json!({ "type": "system", "subtype": "compact_boundary", "sessionId": SESSION, "timestamp": at })
+        .to_string()
 }
 
 /// The main thread of session `s1` folded from `lines`, in order, over `range`.
@@ -1290,32 +1293,38 @@ fn picked_up(range: Range) -> Transcript {
 mod given_a_user_records_prompt {
     use super::*;
 
+    fn text(text: &str) -> UserBlock {
+        UserBlock::Text {
+            text: text.to_owned(),
+            class: class_of(text),
+        }
+    }
+
     #[test]
     fn when_read_then_a_typed_text_or_slash_command_opens_a_turn_and_a_pickup_is_named() {
+        let result = UserBlock::ToolResult(ToolResult {
+            tool_use_id: "t1".to_owned(),
+            is_error: false,
+            parts: vec![ResultPart::Text("x".to_owned())],
+            persisted_output: None,
+        });
         let rows = [
-            (json!(PICKUP_PROMPT), Some(Prompt::Pickup)),
+            (text(PICKUP_PROMPT), Some(Prompt::Pickup)),
             (
-                json!("<command-message>x</command-message><command-name>/x</command-name>"),
+                text("<command-message>x</command-message><command-name>/x</command-name>"),
                 Some(Prompt::Other),
             ),
-            (json!("please continue"), Some(Prompt::Other)),
-            (
-                json!([{ "type": "text", "text": "<system-reminder>x</system-reminder>" }]),
-                None,
-            ),
-            (
-                json!([{ "type": "text", "text": "Base directory for this skill: /x" }]),
-                None,
-            ),
-            (
-                json!([{ "type": "tool_result", "tool_use_id": "t1", "content": "x" }]),
-                None,
-            ),
+            (text("please continue"), Some(Prompt::Other)),
+            (text("<bash-input>ls</bash-input>"), Some(Prompt::Other)),
+            (text("<system-reminder>x</system-reminder>"), None),
+            (text("[Request interrupted by user]"), None),
+            (text("Base directory for this skill: /x"), None),
+            (result, None),
         ];
 
-        for (content, expected) in rows {
-            let record = json!({ "type": "user", "message": { "content": content } });
-            assert_eq!(prompt(&record), expected, "{content}");
+        for (block, expected) in rows {
+            let blocks = [block];
+            assert_eq!(prompt(&blocks), expected, "{blocks:?}");
         }
     }
 }

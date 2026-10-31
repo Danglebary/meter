@@ -82,21 +82,31 @@ pub fn home_unset() -> String {
         .to_owned()
 }
 
-/// The line printed on stderr where the transcript store could not be listed.
+/// The line printed on stderr where a folder of the transcript store could not be listed.
 #[must_use]
-pub fn store_unread(path: &Path, error: &io::Error) -> String {
+pub fn store_unread(path: &Path, kind: io::ErrorKind) -> String {
     format!(
-        "meter: the transcript store at {} could not be read: {error}\n",
+        "meter: the transcript store at {} could not be read: {kind}\n",
         path.display()
     )
 }
 
-/// The line printed on stderr where the transcript store holds more files than a report
-/// reads.
+/// The line printed on stderr where a folder of the transcript store holds more entries
+/// than a report reads.
 #[must_use]
-pub fn store_too_large(path: &Path, files_max: usize) -> String {
+pub fn store_too_large(path: &Path, entries_max: usize) -> String {
     format!(
-        "meter: the transcript store at {} holds more than {files_max} entries, more than a report reads\n",
+        "meter: the transcript store at {} holds more than {entries_max} entries, more than a report reads\n",
+        path.display()
+    )
+}
+
+/// The line printed on stderr where the transcript store, or one folder of it, holds more
+/// transcripts than a report reads.
+#[must_use]
+pub fn store_too_many_transcripts(path: &Path, transcripts_max: usize) -> String {
+    format!(
+        "meter: the transcript store at {} holds more than {transcripts_max} transcripts, more than a report reads\n",
         path.display()
     )
 }
@@ -114,20 +124,20 @@ pub fn transcript_unread(path: &Path, error: &io::Error) -> String {
 /// The line printed on stderr where one transcript runs past the lines a report reads of
 /// it; the report goes on with the lines read.
 #[must_use]
-pub fn transcript_truncated(path: &Path, lines_max: usize) -> String {
+pub fn transcript_truncated(path: &Path, lines_max: u64) -> String {
     format!(
         "meter: the transcript at {} runs past {lines_max} lines; the lines after are left out\n",
         path.display()
     )
 }
 
-/// The line printed on stderr where a subagent's meta file could not be read; the
-/// subagent's type reads as unknown.
+/// The line printed on stderr where the meta file beside the subagent transcript at
+/// `transcript` could not be read; the subagent's type reads as unknown.
 #[must_use]
-pub fn meta_unread(path: &Path, error: &io::Error) -> String {
+pub fn meta_unread(transcript: &Path, kind: io::ErrorKind) -> String {
     format!(
-        "meter: the subagent meta file at {} could not be read, so its type is unknown: {error}\n",
-        path.display()
+        "meter: the meta file beside the subagent transcript at {} could not be read, so its type is unknown: {kind}\n",
+        transcript.display()
     )
 }
 

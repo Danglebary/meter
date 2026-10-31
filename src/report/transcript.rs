@@ -1,11 +1,11 @@
-//! One transcript, read a line at a time: each assistant record carrying usage is read
-//! field by field, the records of one call fold into that call, and what user and
-//! attachment records add to the context is placed among the calls that carry it.
+//! One transcript, read a line at a time: each line is read through the shared transcript
+//! parser, the records of one call fold into that call, and what user and attachment
+//! records add to the context is placed among the calls that carry it.
 
 use std::collections::HashMap;
 
+use claude_code_transcript::record::{self, Assistant, Attachment, TOKENS_PER_FIELD_MAX, User};
 use jiff::Timestamp;
-use serde_json::Value;
 
 use super::carry::{Carriage, Carried, Placed, carriage};
 use super::content::{Item, Prompt, ToolUse, attachment_item, prompt, tool_uses, user_items};
@@ -14,15 +14,6 @@ use super::range::{Range, Thread};
 /// The model Claude Code names on the assistant records it writes itself, such as a notice
 /// of an expired login, which reach no model and carry no tokens.
 pub const SYNTHETIC_MODEL: &str = "<synthetic>";
-/// The most tokens one usage field is read as holding; a field above it is malformed. A
-/// context window holds a small fraction of this.
-pub const TOKENS_PER_FIELD_MAX: u64 = 10_000_000;
-/// A user record holds its type in this form, as Claude Code writes JSON without spaces.
-const USER_TYPE: &str = "\"type\":\"user\"";
-/// An attachment record holds its type in this form.
-const ATTACHMENT_TYPE: &str = "\"type\":\"attachment\"";
-/// A compaction boundary's system record holds its subtype in this form.
-const COMPACT_BOUNDARY_SUBTYPE: &str = "\"subtype\":\"compact_boundary\"";
 
 /// The tokens one call reports.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -92,138 +83,81 @@ pub enum Line {
     Malformed(&'static str),
 }
 
-/// Reads one line of a transcript.
+/// Reads one line of a transcript, its line end left off.
+///
+/// # Panics
+///
+/// Where `text` holds a line end, which the shared parser refuses.
 #[must_use]
 pub fn read_line(text: &str) -> Line {
-    // A record the report reads holds one of these texts, so a line holding none of them
-    // skips the parse.
-    let assistant = text.contains("\"assistant\"");
-    let user = text.contains(USER_TYPE);
-    let attachment = text.contains(ATTACHMENT_TYPE);
-    let compaction = text.contains(COMPACT_BOUNDARY_SUBTYPE);
-    let read = assistant || user || attachment || compaction;
-    if !read {
-        return Line::Other;
-    }
-    let Ok(value) = serde_json::from_str::<Value>(text) else {
-        return Line::Malformed("");
-    };
-    match value.pointer("/type").and_then(Value::as_str) {
-        Some("assistant") => read_assistant(&value),
-        Some("user") => read_added(&value, user_items(&value), prompt(&value)),
-        Some("attachment") => {
-            read_added(&value, attachment_item(&value).into_iter().collect(), None)
-        }
-        Some("system") => read_compaction(&value),
-        _ => Line::Other,
-    }
-}
-
-fn read_assistant(value: &Value) -> Line {
-    let identified = value.pointer("/message/id").is_some_and(|id| !id.is_null());
-    let metered = value
-        .pointer("/message/usage")
-        .is_some_and(|usage| !usage.is_null());
-    if identified {
-        if metered {
-            return match read_record(value) {
-                Ok(record) => Line::Record(record),
-                Err(pointer) => Line::Malformed(pointer),
-            };
-        }
-    }
-    Line::Other
-}
-
-/// A user or attachment record's `items` and the turn it opens, placed at its time; a
-/// record adding nothing is no record the report reads.
-fn read_added(value: &Value, items: Vec<Item>, prompt: Option<Prompt>) -> Line {
-    if items.is_empty() {
-        assert!(prompt.is_none(), "a prompt adds its text to the context");
-        return Line::Other;
-    }
-    let Ok(stamp) = text(value, "/timestamp") else {
-        return Line::Malformed("/timestamp");
-    };
-    match stamp.parse::<Timestamp>() {
-        Ok(timestamp) => Line::Added {
-            timestamp,
-            items,
-            prompt,
+    let read = record::read_line(text);
+    match read {
+        record::Line::Assistant(assistant) => Line::Record(record_of(assistant)),
+        record::Line::User(user) => user_line(&user),
+        record::Line::Attachment(attachment) => attachment_line(&attachment),
+        record::Line::Compaction(compaction) => Line::Compaction {
+            timestamp: compaction.envelope.timestamp,
         },
-        Err(_) => Line::Malformed("/timestamp"),
+        record::Line::Other => Line::Other,
+        record::Line::Malformed(pointer) => Line::Malformed(pointer),
     }
 }
 
-/// A system record marking a compaction boundary; any other system record is no record
-/// the report reads.
-fn read_compaction(value: &Value) -> Line {
-    let boundary = value.pointer("/subtype").and_then(Value::as_str) == Some("compact_boundary");
-    if !boundary {
-        return Line::Other;
-    }
-    let Ok(stamp) = text(value, "/timestamp") else {
-        return Line::Malformed("/timestamp");
-    };
-    match stamp.parse::<Timestamp>() {
-        Ok(timestamp) => Line::Compaction { timestamp },
-        Err(_) => Line::Malformed("/timestamp"),
-    }
-}
-
-fn read_record(value: &Value) -> Result<Record, &'static str> {
-    let message_id = text(value, "/message/id")?;
-    let stamp = text(value, "/timestamp")?;
-    let Ok(timestamp) = stamp.parse::<Timestamp>() else {
-        return Err("/timestamp");
-    };
-    let model = text(value, "/message/model")?;
-    let effort = match value.pointer("/effort") {
-        None | Some(Value::Null) => None,
-        Some(_) => Some(text(value, "/effort")?),
-    };
-    let usage = Usage {
-        input: tokens(value, "/message/usage/input_tokens")?,
-        cache_read: tokens(value, "/message/usage/cache_read_input_tokens")?,
-        cache_write_5m: tokens(
-            value,
-            "/message/usage/cache_creation/ephemeral_5m_input_tokens",
-        )?,
-        cache_write_1h: tokens(
-            value,
-            "/message/usage/cache_creation/ephemeral_1h_input_tokens",
-        )?,
-        output: tokens(value, "/message/usage/output_tokens")?,
-        thinking: tokens(
-            value,
-            "/message/usage/output_tokens_details/thinking_tokens",
-        )?,
-    };
-    Ok(Record {
-        message_id,
-        timestamp,
-        model,
-        effort,
+fn record_of(assistant: Assistant) -> Record {
+    let tool_uses = tool_uses(&assistant.blocks);
+    let usage = usage_of(assistant.usage);
+    Record {
+        message_id: assistant.message_id,
+        timestamp: assistant.envelope.timestamp,
+        model: assistant.model,
+        effort: assistant.effort,
         usage,
-        tool_uses: tool_uses(value),
-    })
-}
-
-fn text(value: &Value, pointer: &'static str) -> Result<String, &'static str> {
-    match value.pointer(pointer) {
-        Some(Value::String(text)) if !text.is_empty() => Ok(text.clone()),
-        _ => Err(pointer),
+        tool_uses,
     }
 }
 
-/// A count of tokens; an absent field counts none.
-fn tokens(value: &Value, pointer: &'static str) -> Result<u64, &'static str> {
-    match value.pointer(pointer) {
-        None | Some(Value::Null) => Ok(0),
-        Some(field) => match field.as_u64() {
-            Some(count) if count <= TOKENS_PER_FIELD_MAX => Ok(count),
-            Some(_) | None => Err(pointer),
-        },
+/// The tokens a call reports, field for field.
+const fn usage_of(usage: record::Usage) -> Usage {
+    let record::Usage {
+        input,
+        cache_read,
+        cache_write_5m,
+        cache_write_1h,
+        output,
+        thinking,
+    } = usage;
+    Usage {
+        input,
+        cache_read,
+        cache_write_5m,
+        cache_write_1h,
+        output,
+        thinking,
+    }
+}
+
+/// A user record's items and the turn it opens, placed at its time; a record adding
+/// nothing is no record the report reads.
+fn user_line(user: &User) -> Line {
+    let items = user_items(&user.blocks);
+    let opened = prompt(&user.blocks);
+    if items.is_empty() {
+        assert!(opened.is_none(), "a prompt adds its text to the context");
+        return Line::Other;
+    }
+    Line::Added {
+        timestamp: user.envelope.timestamp,
+        items,
+        prompt: opened,
+    }
+}
+
+fn attachment_line(attachment: &Attachment) -> Line {
+    let item = attachment_item(attachment);
+    Line::Added {
+        timestamp: attachment.envelope.timestamp,
+        items: vec![item],
+        prompt: None,
     }
 }
 

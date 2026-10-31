@@ -25,14 +25,15 @@ pub use carry::{
     fill_section,
 };
 pub use content::{
-    IMAGE_CHARACTERS, Item, Prompt, TextClass, ToolUse, class, content_characters, program, prompt,
+    IMAGE_CHARACTERS, Item, Prompt, TextClass, ToolUse, content_characters, program, prompt,
+    text_class,
 };
 pub use context::{
     Band, CONTEXT_BAND_EDGES_TOKENS, ContextSection, LONG_CONTEXT_FLOOR_TOKENS, context_section,
 };
 pub use cost::{Buckets, CostSection, Spend, Ttl, Writes, cost_section};
 pub use price::{Cost, PRICES_AS_OF, cache_read_rate, cost};
-pub use range::{Location, Range, RangeFault, Selection, Thread, project_directory};
+pub use range::{Location, Range, RangeFault, Selection, Thread};
 pub use rebuilds::{
     Gap, Kind, REBUILD_CONTEXT_FLOOR_TOKENS, RebuildSection, Rebuilds, TTL_1H_MILLISECONDS,
     TTL_5M_MILLISECONDS, rebuild_section,
@@ -41,8 +42,7 @@ pub use render::{to_json, to_text};
 pub use sessions::{SessionSection, Spread, session_section, spread};
 pub use subagents::{Agents, SubagentSection, agent_type, subagent_section};
 pub use transcript::{
-    Call, Fold, Line, Prior, Record, SYNTHETIC_MODEL, TOKENS_PER_FIELD_MAX, Transcript, Turn,
-    Usage, read_line,
+    Call, Fold, Line, Prior, Record, SYNTHETIC_MODEL, Transcript, Turn, Usage, read_line,
 };
 
 use jiff::Timestamp;
@@ -50,13 +50,6 @@ use tally::plus;
 
 /// The most transcripts a report reads; the store holds about a hundredth of this.
 pub const TRANSCRIPTS_MAX: usize = 100_000;
-/// The most lines a report reads of one transcript; the longest in the store holds a small
-/// fraction of this.
-pub const LINES_PER_TRANSCRIPT_MAX: usize = 1_000_000;
-/// The longest line a report reads; a longer one counts as malformed.
-pub const LINE_BYTES_MAX: usize = 64 * 1024 * 1024;
-/// The most of a subagent's meta file a report reads; one holds a few hundred bytes.
-pub const META_BYTES_MAX: u64 = 64 * 1024;
 
 /// What a report measured, and each section of it.
 #[derive(Debug, Clone, PartialEq, Eq)]

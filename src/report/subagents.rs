@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use serde_json::Value;
+use claude_code_transcript::store::AgentType;
 
 use super::price::cost;
 use super::range::Thread;
@@ -50,13 +50,15 @@ impl Agents {
     }
 }
 
-/// The type a subagent's meta file names, where it is a JSON object naming one.
+/// The type a subagent's meta file names, where it names one; a file naming none, missing,
+/// malformed, or unread leaves the type unknown.
 #[must_use]
-pub fn agent_type(meta: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(meta).ok()?;
-    match value.pointer("/agentType") {
-        Some(Value::String(name)) if !name.is_empty() => Some(name.clone()),
-        _ => None,
+pub fn agent_type(read: &AgentType) -> Option<String> {
+    match read {
+        AgentType::Named(name) => Some(name.clone()),
+        AgentType::Unnamed | AgentType::NoMeta | AgentType::Malformed | AgentType::Unread(_) => {
+            None
+        }
     }
 }
 

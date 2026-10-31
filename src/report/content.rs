@@ -3,15 +3,16 @@
 //! measured in characters. A character is a Unicode scalar value, the unit jq's `length`
 //! counts, which the baseline's extract measured in.
 
+use claude_code_transcript::record::{self, AssistantBlock, Attachment, ResultPart, UserBlock};
 use serde_json::Value;
 
 /// The characters an image block counts as.
 pub const IMAGE_CHARACTERS: u64 = 6_000;
-const SKILL_BODY_OPENING: &str = "Base directory for this skill";
-const SLASH_COMMAND_MARK: &str = "<command-name>";
 const PICKUP_COMMAND_MARK: &str = "<command-name>/pirr:pickup</command-name>";
-const HARNESS_OPENINGS: [&str; 3] = ["<system-reminder", "<local-command", "<task-notification"];
+/// The tag Claude Code wraps a shell command the user ran with `!` in.
+const SHELL_INPUT_TAG: &str = "bash-input";
 const BASH_TOOL: &str = "Bash";
+const COMMAND_FIELD: &str = "command";
 const DIRECTORY_CHANGE: &str = "cd ";
 
 /// A tool call an assistant record makes.
@@ -74,98 +75,85 @@ pub enum Prompt {
     Other,
 }
 
-/// The tool calls in an assistant record's content.
+/// The tool calls among an assistant record's blocks.
+///
+/// # Panics
+///
+/// Where it finds more calls than there are blocks, which no record can cause.
 #[must_use]
-pub fn tool_uses(record: &Value) -> Vec<ToolUse> {
-    let Some(content) = record.pointer("/message/content").and_then(Value::as_array) else {
-        return Vec::new();
+pub fn tool_uses(blocks: &[AssistantBlock]) -> Vec<ToolUse> {
+    let mut tool_uses = Vec::new();
+    for block in blocks {
+        if let AssistantBlock::ToolUse(tool_use) = block {
+            let named = tool_use_of(tool_use);
+            tool_uses.push(named);
+        }
+    }
+    assert!(
+        tool_uses.len() <= blocks.len(),
+        "each tool call is one block"
+    );
+    tool_uses
+}
+
+fn tool_use_of(tool_use: &record::ToolUse) -> ToolUse {
+    let command = tool_use.input.get(COMMAND_FIELD).and_then(Value::as_str);
+    let program = if tool_use.name == BASH_TOOL {
+        command.and_then(program)
+    } else {
+        None
     };
-    content
-        .iter()
-        .filter(|block| block.pointer("/type").and_then(Value::as_str) == Some("tool_use"))
-        .filter_map(|block| {
-            let id = block.pointer("/id").and_then(Value::as_str)?;
-            let name = block.pointer("/name").and_then(Value::as_str)?;
-            let command = block.pointer("/input/command").and_then(Value::as_str);
-            let program = if name == BASH_TOOL {
-                command.and_then(program)
-            } else {
-                None
-            };
-            Some(ToolUse {
-                id: id.to_owned(),
-                name: name.to_owned(),
-                program,
-            })
-        })
-        .collect()
+    ToolUse {
+        id: tool_use.id.clone(),
+        name: tool_use.name.clone(),
+        program,
+    }
 }
 
-/// What a user record adds: its tool results and its text.
+/// What a user record's blocks add: its tool results and its text.
+///
+/// # Panics
+///
+/// Where it finds more items than there are blocks, which no record can cause.
 #[must_use]
-pub fn user_items(record: &Value) -> Vec<Item> {
-    match record.pointer("/message/content") {
-        Some(Value::String(text)) => vec![text_item(text)],
-        Some(Value::Array(blocks)) => blocks.iter().filter_map(block_item).collect(),
-        _ => Vec::new(),
-    }
-}
-
-fn block_item(block: &Value) -> Option<Item> {
-    match block.pointer("/type").and_then(Value::as_str) {
-        Some("tool_result") => {
-            let tool_use_id = block.pointer("/tool_use_id").and_then(Value::as_str)?;
-            let content = block.pointer("/content").unwrap_or(&Value::Null);
-            Some(Item::ToolResult {
-                tool_use_id: tool_use_id.to_owned(),
-                characters: content_characters(content),
-            })
+pub fn user_items(blocks: &[UserBlock]) -> Vec<Item> {
+    let mut items = Vec::new();
+    for block in blocks {
+        match block {
+            UserBlock::Text { text, class } => items.push(Item::Text {
+                class: text_class(class),
+                characters: characters(text),
+            }),
+            UserBlock::ToolResult(result) => items.push(Item::ToolResult {
+                tool_use_id: result.tool_use_id.clone(),
+                characters: content_characters(&result.parts),
+            }),
+            UserBlock::Image | UserBlock::Other => {}
         }
-        Some("text") => {
-            let text = block.pointer("/text").and_then(Value::as_str)?;
-            Some(text_item(text))
-        }
-        _ => None,
     }
+    assert!(items.len() <= blocks.len(), "each item is one block");
+    items
 }
 
 /// What an attachment record adds: the attachment, measured as its JSON text.
 #[must_use]
-pub fn attachment_item(record: &Value) -> Option<Item> {
-    let attachment = record.pointer("/attachment")?;
-    let kind = attachment
-        .pointer("/type")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
-    Some(Item::Text {
-        class: TextClass::Attachment(kind.to_owned()),
-        characters: json_characters(attachment),
-    })
-}
-
-fn text_item(text: &str) -> Item {
+pub fn attachment_item(attachment: &Attachment) -> Item {
     Item::Text {
-        class: class(text),
-        characters: characters(text),
+        class: TextClass::Attachment(attachment.kind.clone()),
+        characters: json_characters(&attachment.body),
     }
 }
 
-/// The prompt a user record makes, where it makes one: text the user typed or a slash
-/// command opens a turn, and harness text and skill bodies open none.
+/// The prompt a user record's blocks make, where they make one: text the user typed or a
+/// slash command opens a turn, and harness text and skill bodies open none.
 #[must_use]
-pub fn prompt(record: &Value) -> Option<Prompt> {
-    let texts: Vec<&str> = match record.pointer("/message/content") {
-        Some(Value::String(text)) => vec![text.as_str()],
-        Some(Value::Array(blocks)) => blocks
-            .iter()
-            .filter(|block| block.pointer("/type").and_then(Value::as_str) == Some("text"))
-            .filter_map(|block| block.pointer("/text").and_then(Value::as_str))
-            .collect(),
-        _ => Vec::new(),
-    };
+pub fn prompt(blocks: &[UserBlock]) -> Option<Prompt> {
     let mut made = None;
-    for text in texts {
-        match class(text) {
+    for block in blocks {
+        let UserBlock::Text { text, class } = block else {
+            continue;
+        };
+        match text_class(class) {
             TextClass::SlashCommand => {
                 if text.contains(PICKUP_COMMAND_MARK) {
                     return Some(Prompt::Pickup);
@@ -180,46 +168,43 @@ pub fn prompt(record: &Value) -> Option<Prompt> {
     made
 }
 
-/// What a piece of user-record text is, by how it opens or what it holds.
+/// How a report counts text the shared parser classes: typed text, and a shell command the
+/// user ran with `!`, as typed by the user; an interruption note and every other tagged
+/// text as harness text.
 #[must_use]
-pub fn class(text: &str) -> TextClass {
-    if text.starts_with(SKILL_BODY_OPENING) {
-        TextClass::SkillBody
-    } else if text.contains(SLASH_COMMAND_MARK) {
-        TextClass::SlashCommand
-    } else if HARNESS_OPENINGS
-        .iter()
-        .any(|opening| text.starts_with(opening))
-    {
-        TextClass::HarnessText
-    } else {
-        TextClass::UserTyped
+pub fn text_class(class: &record::TextClass) -> TextClass {
+    match class {
+        record::TextClass::Typed => TextClass::UserTyped,
+        record::TextClass::SkillBody => TextClass::SkillBody,
+        record::TextClass::SlashCommand => TextClass::SlashCommand,
+        record::TextClass::Interruption => TextClass::HarnessText,
+        record::TextClass::Tagged(tag) => {
+            if tag == SHELL_INPUT_TAG {
+                TextClass::UserTyped
+            } else {
+                TextClass::HarnessText
+            }
+        }
     }
 }
 
-/// The characters a tool result's content holds: a string's, or the sum of its blocks', a
-/// text block counting its text, an image block `IMAGE_CHARACTERS`, and any other block its
-/// JSON text.
+/// The characters a tool result's parts hold: a text part counting its text, an image part
+/// `IMAGE_CHARACTERS`, and any other part its JSON text.
 #[must_use]
-pub fn content_characters(content: &Value) -> u64 {
-    match content {
-        Value::String(text) => characters(text),
-        Value::Array(blocks) => blocks.iter().fold(0_u64, |sum, block| {
-            let counted = match block.pointer("/type").and_then(Value::as_str) {
-                Some("text") => block
-                    .pointer("/text")
-                    .and_then(Value::as_str)
-                    .map_or(0, characters),
-                Some("image") => IMAGE_CHARACTERS,
-                _ => json_characters(block),
-            };
-            let Some(total) = sum.checked_add(counted) else {
-                unreachable!("the characters of a bounded line fit a u64")
-            };
-            total
-        }),
-        other => json_characters(other),
+pub fn content_characters(parts: &[ResultPart]) -> u64 {
+    let mut total: u64 = 0;
+    for part in parts {
+        let counted = match part {
+            ResultPart::Text(text) => characters(text),
+            ResultPart::Image => IMAGE_CHARACTERS,
+            ResultPart::Other(value) => json_characters(value),
+        };
+        let Some(sum) = total.checked_add(counted) else {
+            unreachable!("the characters of a bounded line fit a u64")
+        };
+        total = sum;
     }
+    total
 }
 
 fn json_characters(value: &Value) -> u64 {

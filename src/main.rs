@@ -2,20 +2,21 @@
 //! spend snapshot, prints what the core renders from them, and ends with the exit code the
 //! core names.
 
-use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as Process, ExitCode, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use claude_code_transcript::lines::{LINES_PER_TRANSCRIPT_MAX, Lines, Piece};
+use claude_code_transcript::record::WHOLE_LINE;
+use claude_code_transcript::store::{self, AgentType, Folder, Found, StoreFault};
 use jiff::tz::TimeZone;
 use jiff::{Timestamp, Zoned};
 use meter::cli::{self, Command, Format, ReportArguments};
 use meter::report::{
-    Fold, Gathered, LINE_BYTES_MAX, LINES_PER_TRANSCRIPT_MAX, Line, Location, META_BYTES_MAX,
-    Range, Report, Selection, TRANSCRIPTS_MAX, Thread, Transcript, agent_type, project_directory,
-    read_line, to_json, to_text,
+    Fold, Gathered, Line, Location, Range, Report, Selection, TRANSCRIPTS_MAX, Thread, Transcript,
+    agent_type, read_line, to_json, to_text,
 };
 use meter::statusline::{
     DayStartInput, Facts, GitState, Input, Snapshot, day_start, parse_porcelain, render, to_ansi,
@@ -30,15 +31,6 @@ const GIT_WAIT_MS: u64 = 500;
 const GIT_POLL_MS: u64 = 5;
 const GIT_POLLS_MAX: u64 = GIT_WAIT_MS / GIT_POLL_MS + 1;
 const SNAPSHOT_FILE: &str = "meter/spend-day.json";
-const STORE_DIRECTORY: &str = ".claude/projects";
-const SUBAGENT_DIRECTORY: &str = "subagents";
-const TRANSCRIPT_EXTENSION: &str = "jsonl";
-/// The most directory entries the store's walk visits; the store holds a few thousand.
-const STORE_ENTRIES_MAX: usize = 1_000_000;
-/// The deepest a subagent transcript sits below its session's `subagents` directory; a
-/// workflow's subagents sit two levels down.
-const SUBAGENT_DEPTH_MAX: usize = 4;
-const TRANSCRIPT_BUFFER_BYTES: usize = 1024 * 1024;
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
@@ -266,19 +258,15 @@ fn run_report(arguments: &ReportArguments) -> u8 {
         eprint!("{}", message::home_unset());
         return exit_code::UNREADABLE_STORE;
     };
-    let store = PathBuf::from(home).join(STORE_DIRECTORY);
+    let store = store::projects_folder(Path::new(&home));
     let found = match find_transcripts(&store) {
         Ok(found) => found,
-        Err(StoreFault::Unread(path, error)) => {
-            eprint!("{}", message::store_unread(&path, &error));
-            return exit_code::UNREADABLE_STORE;
-        }
-        Err(StoreFault::TooLarge(entries_max)) => {
-            eprint!("{}", message::store_too_large(&store, entries_max));
+        Err(unfound) => {
+            eprint!("{}", unfound_message(&store, &unfound));
             return exit_code::UNREADABLE_STORE;
         }
     };
-    let selected: Vec<&(Location, PathBuf)> = found
+    let selected: Vec<&(Location, Found)> = found
         .iter()
         .filter(|(location, _)| selection.selects(location))
         .collect();
@@ -314,123 +302,80 @@ fn resolve_projects(projects: &[String]) -> Result<Vec<String>, &str> {
                 Err(_) => return Err(project),
             },
         };
+        assert!(path.is_absolute(), "a resolved project path is absolute");
         let Some(text) = path.to_str() else {
             return Err(project);
         };
-        resolved.push(project_directory(text));
+        resolved.push(store::folder_name_of(text));
     }
+    assert_eq!(
+        resolved.len(),
+        projects.len(),
+        "each project resolves to one folder"
+    );
     Ok(resolved)
 }
 
 /// Why the store's transcripts could not be found.
-enum StoreFault {
-    Unread(PathBuf, io::Error),
-    /// A directory holds more entries, or the store more transcripts, than this bound.
-    TooLarge(usize),
+enum Unfound {
+    /// A folder of the store could not be listed, or passed a bound of the walk.
+    Unlisted(StoreFault),
+    /// The store holds more than `TRANSCRIPTS_MAX` transcripts.
+    TooLarge,
 }
 
-/// Every transcript in the store with where it sits, in path order: a session's main
-/// thread at `<project>/<session>.jsonl`, and its subagents anywhere under
-/// `<project>/<session>/subagents/`.
-fn find_transcripts(store: &Path) -> Result<Vec<(Location, PathBuf)>, StoreFault> {
+/// Every transcript in the store with where it sits, folder by folder in name order and
+/// each folder's in path order, at most `TRANSCRIPTS_MAX` of them.
+fn find_transcripts(projects: &Path) -> Result<Vec<(Location, Found)>, Unfound> {
+    let folders = store::folders(projects).map_err(Unfound::Unlisted)?;
     let mut found = Vec::new();
-    for project_path in list(store)? {
-        let Some(project) = file_name(&project_path) else {
-            continue;
-        };
-        if !project_path.is_dir() {
-            continue;
-        }
-        for entry in list(&project_path)? {
-            let Some(name) = file_name(&entry) else {
-                continue;
-            };
-            let subagents = entry.join(SUBAGENT_DIRECTORY);
-            if is_transcript(&entry) {
-                let Some(session) = entry.file_stem().and_then(|stem| stem.to_str()) else {
-                    continue;
-                };
-                let location = Location {
-                    project: project.clone(),
-                    session: session.to_owned(),
-                    thread: Thread::Main,
-                };
-                found.push((location, entry));
-            } else if subagents.is_dir() {
-                for path in subagent_transcripts(&subagents)? {
-                    let location = Location {
-                        project: project.clone(),
-                        session: name.clone(),
-                        thread: Thread::Subagent,
-                    };
-                    found.push((location, path));
-                }
+    for folder in &folders {
+        let transcripts = store::transcripts_in(folder).map_err(Unfound::Unlisted)?;
+        for transcript in transcripts {
+            if found.len() == TRANSCRIPTS_MAX {
+                return Err(Unfound::TooLarge);
             }
-            if found.len() > TRANSCRIPTS_MAX {
-                return Err(StoreFault::TooLarge(TRANSCRIPTS_MAX));
-            }
+            let location = location_of(folder, &transcript);
+            found.push((location, transcript));
         }
     }
-    found.sort_by(|left, right| left.1.cmp(&right.1));
+    assert!(
+        found.len() <= TRANSCRIPTS_MAX,
+        "the transcripts found stop at their bound"
+    );
     Ok(found)
 }
 
-/// The transcripts under a session's `subagents` directory, at most `SUBAGENT_DEPTH_MAX`
-/// levels down.
-fn subagent_transcripts(subagents: &Path) -> Result<Vec<PathBuf>, StoreFault> {
-    let mut transcripts = Vec::new();
-    let mut pending = vec![(subagents.to_path_buf(), 0_usize)];
-    while let Some((dir, depth)) = pending.pop() {
-        for entry in list(&dir)? {
-            if is_transcript(&entry) {
-                transcripts.push(entry);
-            } else if entry.is_dir() {
-                if depth < SUBAGENT_DEPTH_MAX {
-                    let Some(deeper) = depth.checked_add(1) else {
-                        unreachable!("the depth stays below its bound")
-                    };
-                    pending.push((entry, deeper));
-                }
-            }
-        }
-        if transcripts.len() > TRANSCRIPTS_MAX {
-            return Err(StoreFault::TooLarge(TRANSCRIPTS_MAX));
-        }
+fn location_of(folder: &Folder, found: &Found) -> Location {
+    let thread = match found.thread {
+        store::Thread::Main => Thread::Main,
+        store::Thread::Subagent { .. } => Thread::Subagent,
+    };
+    Location {
+        project: folder.name.clone(),
+        session: found.session.clone(),
+        thread,
     }
-    Ok(transcripts)
 }
 
-/// The entries of a directory, at most `STORE_ENTRIES_MAX` of them.
-fn list(dir: &Path) -> Result<Vec<PathBuf>, StoreFault> {
-    let entries =
-        std::fs::read_dir(dir).map_err(|error| StoreFault::Unread(dir.to_path_buf(), error))?;
-    let mut paths = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|error| StoreFault::Unread(dir.to_path_buf(), error))?;
-        if paths.len() >= STORE_ENTRIES_MAX {
-            return Err(StoreFault::TooLarge(STORE_ENTRIES_MAX));
+fn unfound_message(projects: &Path, unfound: &Unfound) -> String {
+    match unfound {
+        Unfound::Unlisted(StoreFault::Unlisted { path, kind }) => {
+            message::store_unread(path, *kind)
         }
-        paths.push(entry.path());
+        Unfound::Unlisted(StoreFault::TooManyEntries { path }) => {
+            message::store_too_large(path, store::FOLDER_ENTRIES_MAX)
+        }
+        Unfound::Unlisted(StoreFault::TooManyTranscripts { path }) => {
+            message::store_too_many_transcripts(path, store::TRANSCRIPTS_PER_FOLDER_MAX)
+        }
+        Unfound::TooLarge => message::store_too_many_transcripts(projects, TRANSCRIPTS_MAX),
     }
-    Ok(paths)
-}
-
-fn file_name(path: &Path) -> Option<String> {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .map(str::to_owned)
-}
-
-fn is_transcript(path: &Path) -> bool {
-    let named = path
-        .extension()
-        .is_some_and(|extension| extension == TRANSCRIPT_EXTENSION);
-    if named { path.is_file() } else { false }
 }
 
 /// Reads each transcript. A transcript that cannot be read is named on stderr and counted,
 /// and the report goes on without it.
-fn read_transcripts(selected: &[&(Location, PathBuf)], range: Range) -> (Vec<Transcript>, u64) {
+fn read_transcripts(selected: &[&(Location, Found)], range: Range) -> (Vec<Transcript>, u64) {
     let mut transcripts = Vec::new();
     let mut unread: u64 = 0;
     for found in selected {
@@ -438,7 +383,7 @@ fn read_transcripts(selected: &[&(Location, PathBuf)], range: Range) -> (Vec<Tra
             Ok(Some(transcript)) => transcripts.push(transcript),
             Ok(None) => {}
             Err(error) => {
-                eprint!("{}", message::transcript_unread(&found.1, &error));
+                eprint!("{}", message::transcript_unread(&found.1.path, &error));
                 let Some(more) = unread.checked_add(1) else {
                     unreachable!("the transcripts read are bounded far below a u64")
                 };
@@ -451,18 +396,18 @@ fn read_transcripts(selected: &[&(Location, PathBuf)], range: Range) -> (Vec<Tra
 
 /// The transcript's calls in the range, or nothing where its last write falls before the
 /// range starts.
-fn read_transcript(found: &(Location, PathBuf), range: Range) -> io::Result<Option<Transcript>> {
-    let (location, path) = found;
-    let written = std::fs::metadata(path)?.modified()?;
+fn read_transcript(found: &(Location, Found), range: Range) -> io::Result<Option<Transcript>> {
+    let (location, transcript) = found;
+    let written = std::fs::metadata(&transcript.path)?.modified()?;
     let written = Timestamp::try_from(written).map_err(io::Error::other)?;
     if !range.may_hold_records_written_until(written) {
         return Ok(None);
     }
-    let fold = fold_transcript(path, range)?;
+    let fold = fold_transcript(&transcript.path, range)?;
     let folded = fold.finish(location.session.clone(), location.thread);
-    let agent_type = match location.thread {
-        Thread::Main => None,
-        Thread::Subagent => read_agent_type(path),
+    let agent_type = match &transcript.thread {
+        store::Thread::Main => None,
+        store::Thread::Subagent { agent_type, .. } => subagent_type(&transcript.path, agent_type),
     };
     Ok(Some(Transcript {
         agent_type,
@@ -470,70 +415,34 @@ fn read_transcript(found: &(Location, PathBuf), range: Range) -> io::Result<Opti
     }))
 }
 
-/// The fold of the transcript's lines, at most `LINES_PER_TRANSCRIPT_MAX` of them.
+/// The fold of the transcript's lines, under the shared parser's bounds on them.
 fn fold_transcript(path: &Path, range: Range) -> io::Result<Fold> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::with_capacity(TRANSCRIPT_BUFFER_BYTES, file);
+    let mut lines = Lines::open(path)?;
     let mut fold = Fold::new(range);
-    for _ in 0..LINES_PER_TRANSCRIPT_MAX {
-        let line = match next_line(&mut reader)? {
+    for _ in 0..=LINES_PER_TRANSCRIPT_MAX {
+        let piece = lines.next_piece()?;
+        let line = match piece {
+            Piece::Text { text, .. } => read_line(&text),
+            Piece::TooLong { .. } | Piece::NotText { .. } => Line::Malformed(WHOLE_LINE),
             Piece::End => return Ok(fold),
-            Piece::TooLong => Line::Malformed(""),
-            Piece::Text(bytes) => match std::str::from_utf8(&bytes) {
-                Ok(text) => read_line(text),
-                Err(_) => Line::Malformed(""),
-            },
+            Piece::PastTheBound => {
+                eprint!(
+                    "{}",
+                    message::transcript_truncated(path, LINES_PER_TRANSCRIPT_MAX)
+                );
+                return Ok(fold);
+            }
         };
         fold.take(line);
     }
-    eprint!(
-        "{}",
-        message::transcript_truncated(path, LINES_PER_TRANSCRIPT_MAX)
-    );
-    Ok(fold)
+    unreachable!("a read ends within {LINES_PER_TRANSCRIPT_MAX} lines and the piece past them")
 }
 
-/// The type the subagent's sibling meta file names: none where the file is missing or
-/// names none, and none, named on stderr, where it cannot be read.
-fn read_agent_type(transcript: &Path) -> Option<String> {
-    let meta = transcript.with_extension("meta.json");
-    let file = match File::open(&meta) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
-        Err(error) => {
-            eprint!("{}", message::meta_unread(&meta, &error));
-            return None;
-        }
-    };
-    let mut text = String::new();
-    if let Err(error) = file.take(META_BYTES_MAX).read_to_string(&mut text) {
-        eprint!("{}", message::meta_unread(&meta, &error));
-        return None;
+/// The subagent's type as its meta file names it, naming on stderr a meta file that could
+/// not be read.
+fn subagent_type(transcript: &Path, read: &AgentType) -> Option<String> {
+    if let AgentType::Unread(kind) = read {
+        eprint!("{}", message::meta_unread(transcript, *kind));
     }
-    agent_type(&text)
-}
-
-/// One line of a transcript.
-enum Piece {
-    Text(Vec<u8>),
-    /// A line longer than `LINE_BYTES_MAX`, skipped through its end.
-    TooLong,
-    End,
-}
-
-fn next_line(reader: &mut impl BufRead) -> io::Result<Piece> {
-    let Ok(limit) = u64::try_from(LINE_BYTES_MAX) else {
-        unreachable!("the line bound fits a u64")
-    };
-    let mut bytes = Vec::new();
-    let read = reader.by_ref().take(limit).read_until(b'\n', &mut bytes)?;
-    if read == 0 {
-        return Ok(Piece::End);
-    }
-    let ended = bytes.last() == Some(&b'\n');
-    if ended || read < LINE_BYTES_MAX {
-        return Ok(Piece::Text(bytes));
-    }
-    reader.skip_until(b'\n')?;
-    Ok(Piece::TooLong)
+    agent_type(read)
 }

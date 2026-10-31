@@ -16,13 +16,15 @@ The toolchain is pinned once, in `rust-toolchain.toml`, which both the flake and
 
 CI also builds the flake's package on Linux and macOS. It compiles from the file set `flake.nix` lists, so a file the manifest names outside `src/` joins that set.
 
+Transcripts are read through `claude-code-transcript`, a git dependency in `Cargo.toml` pinned to a release tag. Moving the pin moves its `outputHashes` entry in `flake.nix`: the first `nix build` after the move fails and prints the hash to write.
+
 ## Releases
 
 Raise `version` in `Cargo.toml` and merge to `main`. `.github/workflows/release.yml` publishes a release when the version has no release yet and builds nothing otherwise. Once it publishes, it sends Danglebary/dotfiles an `input-released` repository dispatch carrying the input name, the version, and the released commit, with the `DOTFILES_TOKEN` secret. Archives are named by target alone, so `releases/latest/download/meter-<target>.tar.gz` resolves to the newest build.
 
 ## Shape
 
-`src/lib.rs` is the functional core and does no IO: the argument grammar (`cli`), every message (`message`), the exit codes (`exit_code`), the status line (`statusline`), which reads Claude Code's input field by field, parses git's porcelain output, counts business days, decides which spend reading starts the day, and renders the lines, and the report (`report`), which places the range in time, selects transcripts by where they sit in the store, reads each line field by field, folds a call's records into the call, prices it, and renders the report as text or JSON. `src/main.rs` is the shell: it reads stdin, the clock, the environment, git under a bound, the day's spend snapshot, and the transcript store under `~/.claude/projects`, hands them to the core, prints, and maps outcomes to exit codes. A new decision goes in the library with a unit test; `main.rs` holds wiring, which `tests/cli.rs` covers against the built binary in scratch directories.
+`src/lib.rs` is the functional core and does no IO: the argument grammar (`cli`), every message (`message`), the exit codes (`exit_code`), the status line (`statusline`), which reads Claude Code's input field by field, parses git's porcelain output, counts business days, decides which spend reading starts the day, and renders the lines, and the report (`report`), which places the range in time, selects transcripts by where they sit in the store, takes each line as the shared transcript parser reads it, folds a call's records into the call, prices it, and renders the report as text or JSON. `src/main.rs` is the shell: it reads stdin, the clock, the environment, git under a bound, the day's spend snapshot, and the transcript store under `~/.claude/projects` through the shared parser's walk and line reader, hands them to the core, prints, and maps outcomes to exit codes. A new decision goes in the library with a unit test; `main.rs` holds wiring, which `tests/cli.rs` covers against the built binary in scratch directories.
 
 The lint table denies `unwrap`, `expect`, `panic!`, indexing, slicing, string slicing, `as` casts, and unchecked arithmetic. A programmer error crashes through `assert!` or `unreachable!` with a message; arithmetic goes through `checked_*` with a `let ... else { unreachable!(..) }`, and slicing through `.get(..)`.
 
