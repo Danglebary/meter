@@ -254,6 +254,19 @@ fn cost_line(input: &Input, limit: &SpendLimit, facts: &Facts) -> Line {
         );
         return line;
     };
+    let period = period_segment(limit, dollars, facts.now);
+    let daily = match limit.period {
+        Field::Present(Period::Daily) => true,
+        Field::Present(Period::Weekly | Period::Monthly) | Field::Absent | Field::Malformed(_) => {
+            false
+        }
+    };
+    if daily {
+        // The day is the whole period, so the day's spend is the period's and its pace is the
+        // limit itself.
+        line.append(" | ", period);
+        return line;
+    }
     let today = facts.now.date();
     let last_day = Timestamp::from_second(limit.resets_at.saturating_sub(1))
         .ok()
@@ -262,16 +275,7 @@ fn cost_line(input: &Input, limit: &SpendLimit, facts: &Facts) -> Line {
     if let (Some(day_start), Some(days_left)) = (facts.day_start_usd, days_left) {
         line.append(" | ", day_segment(dollars, day_start, days_left));
     }
-    let elapsed = period_elapsed(limit, facts.now);
-    line.push_after(
-        " | ",
-        format_dollars(dollars.used),
-        pace_color(limit.used_percentage, elapsed),
-    );
-    line.push(
-        format!(" / {}", format_dollars(dollars.limit)),
-        Color::Plain,
-    );
+    line.append(" | ", period);
     let tomorrow = today.tomorrow().ok();
     let days_after = tomorrow
         .zip(last_day)
@@ -302,6 +306,21 @@ fn day_segment(dollars: &Dollars, day_start_usd: f64, business_days_left: u32) -
     let mut line = Line::default();
     line.push(format_dollars(spent), color);
     line.push(format!(" / {}", format_dollars(pace)), Color::Plain);
+    line
+}
+
+/// The period's spend over its limit, colored by its pace.
+fn period_segment(limit: &SpendLimit, dollars: &Dollars, now: &Zoned) -> Line {
+    let elapsed = period_elapsed(limit, now);
+    let mut line = Line::default();
+    line.push(
+        format_dollars(dollars.used),
+        pace_color(limit.used_percentage, elapsed),
+    );
+    line.push(
+        format!(" / {}", format_dollars(dollars.limit)),
+        Color::Plain,
+    );
     line
 }
 

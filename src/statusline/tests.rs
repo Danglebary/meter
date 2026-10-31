@@ -385,6 +385,43 @@ mod given_a_spend_limited_account {
 
         assert_eq!(Run::of(input).texts()[2], "$21.45 | spend 10%");
     }
+
+    /// A daily limit resetting 2026-10-29 at midnight, so 62.5% of its day has passed.
+    fn daily(used_percentage: f64, used_usd: f64) -> Value {
+        with(&[(
+            "/rate_limits",
+            Some(json!({ "spend_limit": {
+                "used_percentage": used_percentage, "resets_at": epoch(&at(date(2026, 10, 29), 0, 0)),
+                "used_usd": used_usd, "limit_usd": 50.0, "period": "daily"
+            }})),
+        )])
+    }
+
+    #[test]
+    fn when_the_period_is_daily_then_line_three_shows_the_session_and_the_days_spend_over_the_limit_alone()
+     {
+        let mut run = Run::of(daily(60.0, 30.0));
+        run.day_start_usd = Some(12.0);
+
+        assert_eq!(run.texts()[2], "$21.45 | $30 / $50");
+    }
+
+    #[test]
+    fn when_the_period_is_daily_then_the_days_spend_is_colored_by_the_share_of_the_day_passed() {
+        let rows = [
+            (60.0, 30.0, "$30", Color::Green),
+            (70.0, 35.0, "$35", Color::Yellow),
+            (80.0, 40.0, "$40", Color::Red),
+        ];
+
+        for (used_percentage, used_usd, shown, color) in rows {
+            let mut run = Run::of(daily(used_percentage, used_usd));
+            run.day_start_usd = Some(0.0);
+            let lines = run.lines();
+
+            assert_eq!(color_of(&lines[2], shown), Some(color), "{used_percentage}");
+        }
+    }
 }
 
 mod given_a_malformed_field {
