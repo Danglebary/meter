@@ -107,7 +107,11 @@ mod support {
     /// subagent, and one in `/home/q`.
     pub fn store() -> Scratch {
         let scratch = Scratch::new();
-        let user = serde_json::json!({ "type": "user", "message": { "content": "hi" } });
+        let user = serde_json::json!({
+            "type": "user",
+            "timestamp": "2026-10-30T09:59:00Z",
+            "message": { "content": "hi" }
+        });
         scratch.transcript(
             "-home-p/s1.jsonl",
             &[user.to_string(), call("a", "2026-10-30T10:00:00Z")],

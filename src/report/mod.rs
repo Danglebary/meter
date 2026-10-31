@@ -5,6 +5,8 @@
 //! calls are measured section by section and rendered as text or JSON. Nothing here reads
 //! a file, the clock, or the environment, so every rule is tested against values.
 
+mod carry;
+mod content;
 mod context;
 mod cost;
 mod price;
@@ -16,11 +18,16 @@ mod subagents;
 mod tally;
 mod transcript;
 
+pub use carry::{
+    CHARACTERS_PER_TOKEN, Carriage, Carried, Carry, FillSection, OutputCarry, Placed, carriage,
+    fill_section,
+};
+pub use content::{IMAGE_CHARACTERS, Item, TextClass, ToolUse, class, content_characters, program};
 pub use context::{
     Band, CONTEXT_BAND_EDGES_TOKENS, ContextSection, LONG_CONTEXT_FLOOR_TOKENS, context_section,
 };
 pub use cost::{Buckets, CostSection, Spend, Ttl, Writes, cost_section};
-pub use price::{Cost, PRICES_AS_OF, cost};
+pub use price::{Cost, PRICES_AS_OF, cache_read_rate, cost};
 pub use range::{Location, Range, RangeFault, Selection, Thread, project_directory};
 pub use rebuilds::{
     Gap, Kind, REBUILD_CONTEXT_FLOOR_TOKENS, RebuildSection, Rebuilds, TTL_1H_MILLISECONDS,
@@ -58,6 +65,7 @@ pub struct Report {
     pub sessions: SessionSection,
     pub rebuilds: RebuildSection,
     pub subagents: SubagentSection,
+    pub fill: FillSection,
 }
 
 impl Report {
@@ -79,6 +87,7 @@ impl Report {
             sessions: session_section(transcripts),
             rebuilds: rebuild_section(transcripts),
             subagents: subagent_section(transcripts),
+            fill: fill_section(transcripts),
         }
     }
 }

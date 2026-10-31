@@ -1,11 +1,14 @@
 //! One transcript, read a line at a time: each assistant record carrying usage is read
-//! field by field, and the records of one call fold into that call.
+//! field by field, the records of one call fold into that call, and what user and
+//! attachment records add to the context is placed among the calls that carry it.
 
 use std::collections::HashMap;
 
 use jiff::Timestamp;
 use serde_json::Value;
 
+use super::carry::{Carriage, Carried, Placed, carriage};
+use super::content::{Item, ToolUse, attachment_item, tool_uses, user_items};
 use super::range::{Range, Thread};
 
 /// The model Claude Code names on the assistant records it writes itself, such as a notice
@@ -14,6 +17,10 @@ pub const SYNTHETIC_MODEL: &str = "<synthetic>";
 /// The most tokens one usage field is read as holding; a field above it is malformed. A
 /// context window holds a small fraction of this.
 pub const TOKENS_PER_FIELD_MAX: u64 = 10_000_000;
+/// A user record holds its type in this form, as Claude Code writes JSON without spaces.
+const USER_TYPE: &str = "\"type\":\"user\"";
+/// An attachment record holds its type in this form.
+const ATTACHMENT_TYPE: &str = "\"type\":\"attachment\"";
 
 /// The tokens one call reports.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +30,8 @@ pub struct Usage {
     pub cache_write_5m: u64,
     pub cache_write_1h: u64,
     pub output: u64,
+    /// The part of `output` the model spent thinking.
+    pub thinking: u64,
 }
 
 impl Usage {
@@ -56,46 +65,76 @@ pub struct Record {
     pub model: String,
     pub effort: Option<String>,
     pub usage: Usage,
+    pub tool_uses: Vec<ToolUse>,
 }
 
 /// What one line of a transcript holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Line {
     Record(Record),
-    /// Any line that is not an assistant record carrying usage.
+    /// What a user or attachment record adds to the context.
+    Added {
+        timestamp: Timestamp,
+        items: Vec<Item>,
+    },
+    /// Any line that is neither.
     Other,
-    /// An assistant record whose field fails its check; the JSON pointer names the field,
-    /// or the root where the line is not JSON.
+    /// A record whose field fails its check; the JSON pointer names the field, or the root
+    /// where the line is not JSON.
     Malformed(&'static str),
 }
 
 /// Reads one line of a transcript.
 #[must_use]
 pub fn read_line(text: &str) -> Line {
-    // An assistant record holds this text in its `type` field, so a line without it is
-    // no record and skips the parse.
-    if !text.contains("\"assistant\"") {
+    // A record the report reads holds one of these texts, so a line holding none of them
+    // skips the parse.
+    let assistant = text.contains("\"assistant\"");
+    let user = text.contains(USER_TYPE);
+    let attachment = text.contains(ATTACHMENT_TYPE);
+    if !assistant && !user && !attachment {
         return Line::Other;
     }
     let Ok(value) = serde_json::from_str::<Value>(text) else {
         return Line::Malformed("");
     };
-    let assistant = value.pointer("/type").and_then(Value::as_str) == Some("assistant");
+    match value.pointer("/type").and_then(Value::as_str) {
+        Some("assistant") => read_assistant(&value),
+        Some("user") => read_added(&value, user_items(&value)),
+        Some("attachment") => read_added(&value, attachment_item(&value).into_iter().collect()),
+        _ => Line::Other,
+    }
+}
+
+fn read_assistant(value: &Value) -> Line {
     let identified = value.pointer("/message/id").is_some_and(|id| !id.is_null());
     let metered = value
         .pointer("/message/usage")
         .is_some_and(|usage| !usage.is_null());
-    if assistant {
-        if identified {
-            if metered {
-                return match read_record(&value) {
-                    Ok(record) => Line::Record(record),
-                    Err(pointer) => Line::Malformed(pointer),
-                };
-            }
+    if identified {
+        if metered {
+            return match read_record(value) {
+                Ok(record) => Line::Record(record),
+                Err(pointer) => Line::Malformed(pointer),
+            };
         }
     }
     Line::Other
+}
+
+/// A user or attachment record's `items`, placed at its time; a record adding nothing is
+/// no record the report reads.
+fn read_added(value: &Value, items: Vec<Item>) -> Line {
+    if items.is_empty() {
+        return Line::Other;
+    }
+    let Ok(stamp) = text(value, "/timestamp") else {
+        return Line::Malformed("/timestamp");
+    };
+    match stamp.parse::<Timestamp>() {
+        Ok(timestamp) => Line::Added { timestamp, items },
+        Err(_) => Line::Malformed("/timestamp"),
+    }
 }
 
 fn read_record(value: &Value) -> Result<Record, &'static str> {
@@ -121,6 +160,10 @@ fn read_record(value: &Value) -> Result<Record, &'static str> {
             "/message/usage/cache_creation/ephemeral_1h_input_tokens",
         )?,
         output: tokens(value, "/message/usage/output_tokens")?,
+        thinking: tokens(
+            value,
+            "/message/usage/output_tokens_details/thinking_tokens",
+        )?,
     };
     Ok(Record {
         message_id,
@@ -128,6 +171,7 @@ fn read_record(value: &Value) -> Result<Record, &'static str> {
         model,
         effort,
         usage,
+        tool_uses: tool_uses(value),
     })
 }
 
@@ -174,6 +218,8 @@ pub struct Transcript {
     /// The subagent's type, as its meta file names it; none for a main thread, or for a
     /// subagent whose type is unknown.
     pub agent_type: Option<String>,
+    /// What the transcript's context carried, and what its re-reads cost.
+    pub carriage: Carriage,
 }
 
 /// A call outside the calls measured, kept for when it began and which model it named.
@@ -192,6 +238,9 @@ pub struct Fold {
     call_index: HashMap<String, usize>,
     malformed: u64,
     before_range: Option<Prior>,
+    /// The name, and a Bash call's program, of each tool call, by its id.
+    tool_names: HashMap<String, (String, Option<String>)>,
+    placed: Vec<Placed>,
 }
 
 impl Fold {
@@ -203,6 +252,8 @@ impl Fold {
             call_index: HashMap::new(),
             malformed: 0,
             before_range: None,
+            tool_names: HashMap::new(),
+            placed: Vec::new(),
         }
     }
 
@@ -217,25 +268,67 @@ impl Fold {
                 self.malformed = malformed;
             }
             Line::Record(record) => {
-                let synthetic = record.model == SYNTHETIC_MODEL;
+                for tool_use in &record.tool_uses {
+                    let named = (tool_use.name.clone(), tool_use.program.clone());
+                    self.tool_names.insert(tool_use.id.clone(), named);
+                }
                 if self.range.holds(record.timestamp) {
                     self.take_record(record);
                 } else if self.range.precedes(record.timestamp) {
-                    if !synthetic {
-                        let later = self
-                            .before_range
-                            .as_ref()
-                            .is_none_or(|prior| record.timestamp >= prior.timestamp);
-                        if later {
-                            self.before_range = Some(Prior {
-                                timestamp: record.timestamp,
-                                model: record.model,
-                            });
-                        }
+                    self.take_prior(record);
+                }
+            }
+            Line::Added { timestamp, items } => {
+                if self.range.holds(timestamp) {
+                    for item in items {
+                        self.place(item);
                     }
                 }
             }
         }
+    }
+
+    /// Keeps the latest call before the range, a synthetic one aside.
+    fn take_prior(&mut self, record: Record) {
+        let synthetic = record.model == SYNTHETIC_MODEL;
+        let later = self
+            .before_range
+            .as_ref()
+            .is_none_or(|prior| record.timestamp >= prior.timestamp);
+        if !synthetic {
+            if later {
+                self.before_range = Some(Prior {
+                    timestamp: record.timestamp,
+                    model: record.model,
+                });
+            }
+        }
+    }
+
+    /// Places an item after the calls taken so far; a tool result whose call the
+    /// transcript never named is left out.
+    fn place(&mut self, item: Item) {
+        let (carried, characters) = match item {
+            Item::ToolResult {
+                tool_use_id,
+                characters,
+            } => {
+                let Some((tool, program)) = self.tool_names.get(&tool_use_id) else {
+                    return;
+                };
+                let carried = Carried::ToolResult {
+                    tool: tool.clone(),
+                    program: program.clone(),
+                };
+                (carried, characters)
+            }
+            Item::Text { class, characters } => (Carried::Text(class), characters),
+        };
+        self.placed.push(Placed {
+            item: carried,
+            characters,
+            calls_before: self.calls.len(),
+        });
     }
 
     fn take_record(&mut self, record: Record) {
@@ -269,6 +362,8 @@ impl Fold {
     #[must_use]
     pub fn finish(self, session: String, thread: Thread) -> Transcript {
         let total = self.calls.len();
+        // The carriage reads the calls in file order, the order the items were placed in.
+        let carriage = carriage(&self.placed, &self.calls);
         let (synthetic, mut calls): (Vec<Call>, Vec<Call>) = self
             .calls
             .into_iter()
@@ -290,6 +385,7 @@ impl Fold {
             malformed: self.malformed,
             before_range: self.before_range,
             agent_type: None,
+            carriage,
         }
     }
 }

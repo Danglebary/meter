@@ -50,7 +50,8 @@ fn record(fixture: &Fixture) -> String {
                     "ephemeral_5m_input_tokens": usage.cache_write_5m,
                     "ephemeral_1h_input_tokens": usage.cache_write_1h
                 },
-                "output_tokens": usage.output
+                "output_tokens": usage.output,
+                "output_tokens_details": { "thinking_tokens": usage.thinking }
             }
         }
     })
@@ -266,6 +267,7 @@ mod given_a_transcript_line {
                 cache_write_5m: 3,
                 cache_write_1h: 4,
                 output: 5,
+                thinking: 2,
             },
         }
     }
@@ -282,14 +284,16 @@ mod given_a_transcript_line {
                 model: "claude-opus-5-5".to_owned(),
                 effort: Some("xhigh".to_owned()),
                 usage: fixture().usage,
+                tool_uses: Vec::new(),
             })
         );
     }
 
     #[test]
-    fn when_it_holds_no_assistant_record_carrying_usage_then_it_is_skipped() {
+    fn when_it_holds_no_record_the_report_reads_then_it_is_skipped() {
         let rows = [
-            json!({ "type": "user", "message": { "content": "hello" } }).to_string(),
+            json!({ "type": "summary", "summary": "the assistant and the user" }).to_string(),
+            json!({ "type": "user", "timestamp": "2026-10-30T10:00:00Z", "message": { "content": [] } }).to_string(),
             json!({ "type": "assistant", "message": { "id": "a", "model": "m" } }).to_string(),
             json!({ "type": "assistant", "message": { "model": "m", "usage": {} } }).to_string(),
             "not json".to_owned(),
@@ -400,6 +404,7 @@ mod given_a_price_table {
             cache_write_5m: 1_000_000,
             cache_write_1h: 1_000_000,
             output: 1_000_000,
+            thinking: 0,
         };
 
         assert_eq!(
@@ -616,6 +621,12 @@ Cache writes by thread and kind
 Subagents by type, with one subagent's mean cost, calls, and context
             agents    cost   cost each   calls each   starts at   peaks at
   unknown        1   $0.07       $0.07            2       40.0k      40.0k
+
+What fills the main thread's context: an item counts its characters over 4 as tokens, and each later call re-reads them at its own cache-read rate.
+
+The model's own output
+  output            0.0M tokens   $0.00
+  of it, thinking   0.0M tokens   $0.00
 "
         );
     }
@@ -1004,5 +1015,182 @@ mod given_subagents_to_group {
             section.by_type.get(&None).map(|agents| agents.agents),
             Some(1)
         );
+    }
+}
+
+mod given_a_bash_command_line {
+    use super::*;
+
+    #[test]
+    fn when_its_program_is_named_then_a_leading_cd_and_variable_assignments_are_passed() {
+        let rows = [
+            ("git status", Some("git")),
+            ("  cd /home/p && just check", Some("just")),
+            ("cd /home/p; rg foo", Some("rg")),
+            ("S=/tmp/scratch; jq . \"$S/a.json\"", Some("jq")),
+            ("FOO=1 BAR=2 cargo test", Some("cargo")),
+            ("for f in a b; do echo $f; done", Some("for")),
+            ("1>&2 echo", Some("1>&2")),
+            ("", None),
+        ];
+
+        for (command, name) in rows {
+            assert_eq!(program(command).as_deref(), name, "{command}");
+        }
+    }
+}
+
+mod given_a_user_record {
+    use super::*;
+
+    #[test]
+    fn when_its_text_is_classed_then_its_opening_or_mark_decides() {
+        let rows = [
+            ("Base directory for this skill: /x", TextClass::SkillBody),
+            (
+                "<command-message>x</command-message><command-name>/x</command-name>",
+                TextClass::SlashCommand,
+            ),
+            (
+                "<system-reminder>x</system-reminder>",
+                TextClass::HarnessText,
+            ),
+            ("<task-notification>x", TextClass::HarnessText),
+            ("please continue", TextClass::UserTyped),
+        ];
+
+        for (text, expected) in rows {
+            assert_eq!(class(text), expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn when_a_tool_results_content_is_measured_then_each_block_counts_by_its_type() {
+        let content = json!([
+            { "type": "text", "text": "héllo" },
+            { "type": "image", "source": {} },
+            { "type": "other" }
+        ]);
+
+        let other = json!({ "type": "other" }).to_string().chars().count();
+        let expected = 5_u64
+            .checked_add(IMAGE_CHARACTERS)
+            .and_then(|sum| sum.checked_add(u64::try_from(other).unwrap()))
+            .unwrap();
+        assert_eq!(content_characters(&content), expected);
+        assert_eq!(content_characters(&json!("héllo")), 5);
+    }
+
+    #[test]
+    fn when_read_then_its_tool_results_and_text_are_its_items() {
+        let line = json!({
+            "type": "user",
+            "timestamp": "2026-10-30T10:00:00Z",
+            "message": { "content": [
+                { "type": "tool_result", "tool_use_id": "t1", "content": "four" },
+                { "type": "text", "text": "hi" }
+            ] }
+        })
+        .to_string();
+
+        assert_eq!(
+            read_line(&line),
+            Line::Added {
+                timestamp: instant("2026-10-30T10:00:00Z"),
+                items: vec![
+                    Item::ToolResult {
+                        tool_use_id: "t1".to_owned(),
+                        characters: 4,
+                    },
+                    Item::Text {
+                        class: TextClass::UserTyped,
+                        characters: 2,
+                    },
+                ],
+            }
+        );
+    }
+}
+
+mod given_items_carried_in_a_context {
+    use super::*;
+
+    /// An assistant record of call `id` at `at` by `model`, calling tool `t1` where `bash`
+    /// names a command.
+    fn call_line(id: &str, at: &str, model: &str, bash: Option<&str>) -> String {
+        let content = match bash {
+            Some(command) => {
+                json!([{ "type": "tool_use", "id": "t1", "name": "Bash", "input": { "command": command } }])
+            }
+            None => json!([]),
+        };
+        json!({
+            "type": "assistant",
+            "timestamp": at,
+            "message": { "id": id, "model": model, "content": content, "usage": { "output_tokens": 10 } }
+        })
+        .to_string()
+    }
+
+    fn result_line(at: &str, characters: usize) -> String {
+        json!({
+            "type": "user",
+            "timestamp": at,
+            "message": { "content": [{ "type": "tool_result", "tool_use_id": "t1", "content": "x".repeat(characters) }] }
+        })
+        .to_string()
+    }
+
+    fn transcript(lines: &[String]) -> Transcript {
+        let mut fold = Fold::new(Range::default());
+        for line in lines {
+            fold.take(read_line(line));
+        }
+        fold.finish("s1".to_owned(), Thread::Main)
+    }
+
+    #[test]
+    fn when_an_item_is_carried_then_each_later_call_re_reads_it_at_its_own_rate() {
+        let lines = [
+            call_line(
+                "a",
+                "2026-10-30T10:00:00Z",
+                "claude-opus-5-5",
+                Some("git log"),
+            ),
+            result_line("2026-10-30T10:00:01Z", 400),
+            call_line("b", "2026-10-30T10:01:00Z", "claude-opus-5-5", None),
+            call_line("c", "2026-10-30T10:02:00Z", "claude-fable-5-1", None),
+        ];
+
+        let carriage = transcript(&lines).carriage;
+
+        let bash = carriage.tools.get("Bash").unwrap();
+        assert_eq!(bash.tokens(), 100);
+        assert_eq!(bash.nanodollars(), 45_000);
+        assert_eq!(carriage.commands.get("git"), Some(bash));
+    }
+
+    #[test]
+    fn when_output_is_carried_then_the_calls_after_it_alone_re_read_it() {
+        let lines = [
+            call_line("a", "2026-10-30T10:00:00Z", "claude-opus-5-5", None),
+            call_line("b", "2026-10-30T10:01:00Z", "claude-opus-5-5", None),
+        ];
+
+        let output = transcript(&lines).carriage.output;
+
+        assert_eq!(output.tokens, 20);
+        assert_eq!(output.nanodollars, 2_000);
+    }
+
+    #[test]
+    fn when_a_result_names_no_call_the_transcript_made_then_it_is_left_out() {
+        let lines = [
+            result_line("2026-10-30T10:00:01Z", 400),
+            call_line("b", "2026-10-30T10:01:00Z", "claude-opus-5-5", None),
+        ];
+
+        assert!(transcript(&lines).carriage.tools.is_empty());
     }
 }

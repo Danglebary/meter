@@ -6,6 +6,7 @@ use jiff::tz::TimeZone;
 use serde_json::{Map, Number, Value, json};
 use std::cmp::Reverse;
 
+use super::carry::{CHARACTERS_PER_TOKEN, Carry, FillSection};
 use super::context::{Band, ContextSection, LONG_CONTEXT_FLOOR_TOKENS};
 use super::cost::{CostSection, Spend, Ttl, Writes};
 use super::price::PRICES_AS_OF;
@@ -13,6 +14,7 @@ use super::range::{Range, Thread};
 use super::rebuilds::{Gap, Kind, REBUILD_CONTEXT_FLOOR_TOKENS, RebuildSection};
 use super::sessions::{SessionSection, Spread};
 use super::subagents::{Agents, SubagentSection};
+use super::tally::count_one;
 use super::{Measured, Report};
 
 const NANODOLLARS_PER_CENT: u128 = 10_000_000;
@@ -24,6 +26,8 @@ const TENTHS_PER_WHOLE: u128 = 10;
 const PER_MILLE: u128 = 1_000;
 const TOKENS_PER_THOUSAND: u64 = 1_000;
 const THOUSANDS_GROUP: usize = 3;
+/// The programs the text form lists by name; the rest share one row.
+const PROGRAMS_SHOWN_MAX: usize = 10;
 const COLUMN_GAP: &str = "   ";
 const ROW_INDENT: &str = "  ";
 const LOCAL_MINUTE: &str = "%Y-%m-%d %H:%M";
@@ -56,6 +60,18 @@ const REBUILD: Noun = Noun {
     one: "rebuild",
     many: "rebuilds",
 };
+const RESULT: Noun = Noun {
+    one: "result",
+    many: "results",
+};
+const ITEM: Noun = Noun {
+    one: "item",
+    many: "items",
+};
+const PROGRAM: Noun = Noun {
+    one: "other program",
+    many: "other programs",
+};
 
 /// The report as text, its times in `zone`, ending in a newline.
 #[must_use]
@@ -74,6 +90,7 @@ pub fn to_text(report: &Report, zone: &TimeZone) -> String {
         text.push_str(&sessions_text(&report.sessions));
         text.push_str(&rebuild_text(&report.rebuilds));
         text.push_str(&subagent_text(&report.subagents));
+        text.push_str(&fill_text(&report.fill));
     }
     text
 }
@@ -408,6 +425,7 @@ pub fn to_json(report: &Report) -> String {
         "sessions": sessions_json(&report.sessions),
         "rebuilds": rebuild_json(&report.rebuilds),
         "subagents": subagent_json(&report.subagents),
+        "fill": fill_json(&report.fill),
     });
     let Ok(text) = serde_json::to_string_pretty(&value) else {
         unreachable!("a JSON value built from strings and numbers serializes")
@@ -799,4 +817,141 @@ fn subagent_json(subagents: &SubagentSection) -> Value {
         })
         .collect();
     Value::Array(types)
+}
+
+/// Groups most costly first, ties in the map's order.
+fn carry_rows<K: Ord>(groups: &std::collections::BTreeMap<K, Carry>) -> Vec<(&K, Carry)> {
+    let mut rows: Vec<(&K, Carry)> = groups.iter().map(|(key, carry)| (key, *carry)).collect();
+    rows.sort_by_key(|row| Reverse(row.1.nanodollars()));
+    rows
+}
+
+fn carry_row(name: String, carry: Carry, noun: &Noun) -> Vec<Cell> {
+    let tokens = millions(carry.tokens());
+    vec![
+        Cell::left(name),
+        Cell::right(counted(carry.items, noun)),
+        Cell::right(format!("{tokens} tokens")),
+        Cell::right(dollars(carry.nanodollars())),
+    ]
+}
+
+fn fill_text(fill: &FillSection) -> String {
+    let main = &fill.main;
+    let tools: Vec<Vec<Cell>> = carry_rows(&main.tools)
+        .into_iter()
+        .map(|(tool, carry)| carry_row(tool.clone(), carry, &RESULT))
+        .collect();
+    let texts: Vec<Vec<Cell>> = carry_rows(&main.texts)
+        .into_iter()
+        .map(|(class, carry)| carry_row(class.name(), carry, &ITEM))
+        .collect();
+    let output = &main.output;
+    let outputs = vec![
+        vec![
+            Cell::left("output".to_owned()),
+            Cell::right(format!("{} tokens", millions(output.tokens))),
+            Cell::right(dollars(output.nanodollars)),
+        ],
+        vec![
+            Cell::left("of it, thinking".to_owned()),
+            Cell::right(format!("{} tokens", millions(output.thinking_tokens))),
+            Cell::right(dollars(output.thinking_nanodollars)),
+        ],
+    ];
+    let reads = &fill.subagent_reads;
+    let mut text = format!(
+        "\nWhat fills the main thread's context: an item counts its characters over {CHARACTERS_PER_TOKEN} as tokens, and each later call re-reads them at its own cache-read rate.\n"
+    );
+    text.push_str(&section("Tool results", &tools));
+    text.push_str(&section("Bash results, by program", &program_rows(fill)));
+    text.push_str(&section("Text and attachments", &texts));
+    text.push_str(&section("The model's own output", &outputs));
+    if reads.items > 0 {
+        let reads_line = format!(
+            "\nSubagents' Read results: {}, a mean of {} tokens each.\n",
+            grouped(u128::from(reads.items)),
+            grouped(mean_tokens(reads)),
+        );
+        text.push_str(&reads_line);
+    }
+    text
+}
+
+/// The `PROGRAMS_SHOWN_MAX` costliest programs, then one row for the rest.
+fn program_rows(fill: &FillSection) -> Vec<Vec<Cell>> {
+    let rows = carry_rows(&fill.main.commands);
+    let mut cells = Vec::new();
+    let mut rest = Carry::default();
+    let mut rest_programs: u64 = 0;
+    for (index, (program, carry)) in rows.into_iter().enumerate() {
+        if index < PROGRAMS_SHOWN_MAX {
+            cells.push(carry_row(program.clone(), carry, &RESULT));
+        } else {
+            rest = rest.plus(carry);
+            rest_programs = count_one(rest_programs);
+        }
+    }
+    if rest_programs > 0 {
+        cells.push(carry_row(counted(rest_programs, &PROGRAM), rest, &RESULT));
+    }
+    cells
+}
+
+/// The mean tokens of a carry's items, rounded half up.
+fn mean_tokens(carry: &Carry) -> u128 {
+    let items = u128::from(carry.items);
+    assert!(items > 0, "a mean is taken over some items");
+    let divisor = checked(items.checked_mul(CHARACTERS_PER_TOKEN));
+    let half = checked(divisor.checked_div(2));
+    let rounded = checked(carry.characters.checked_add(half));
+    checked(rounded.checked_div(divisor))
+}
+
+fn carry_json(carry: Carry) -> Value {
+    json!({
+        "items": carry.items,
+        "tokens": integer(carry.tokens()),
+        "usd": usd(carry.nanodollars()),
+    })
+}
+
+fn fill_json(fill: &FillSection) -> Value {
+    let main = &fill.main;
+    let tools: Vec<Value> = carry_rows(&main.tools)
+        .into_iter()
+        .map(|(tool, carry)| json!({ "tool": tool, "carried": carry_json(carry) }))
+        .collect();
+    let programs: Vec<Value> = carry_rows(&main.commands)
+        .into_iter()
+        .map(|(program, carry)| json!({ "program": program, "carried": carry_json(carry) }))
+        .collect();
+    let texts: Vec<Value> = carry_rows(&main.texts)
+        .into_iter()
+        .map(|(class, carry)| json!({ "class": class.name(), "carried": carry_json(carry) }))
+        .collect();
+    let reads = &fill.subagent_reads;
+    let mean = if reads.items > 0 {
+        integer(mean_tokens(reads))
+    } else {
+        Value::Null
+    };
+    json!({
+        "thread": Thread::Main.name(),
+        "characters_per_token": integer(CHARACTERS_PER_TOKEN),
+        "tool_results": tools,
+        "bash_programs": programs,
+        "texts": texts,
+        "output": {
+            "tokens": integer(main.output.tokens),
+            "usd": usd(main.output.nanodollars),
+            "thinking_tokens": integer(main.output.thinking_tokens),
+            "thinking_usd": usd(main.output.thinking_nanodollars),
+        },
+        "subagent_read_results": {
+            "items": reads.items,
+            "tokens": integer(reads.tokens()),
+            "mean_tokens": mean,
+        },
+    })
 }

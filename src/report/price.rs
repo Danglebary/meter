@@ -121,6 +121,14 @@ impl Cost {
     }
 }
 
+/// The cache-read rate of `model` for a call sending `context` tokens, in nanodollars per
+/// token, where the table prices the model.
+#[must_use]
+pub fn cache_read_rate(model: &str, context: u64) -> Option<u64> {
+    let rates = rates(model, context)?;
+    Some(rates.cache_read)
+}
+
 /// What a call by `model` reporting `usage` cost, where the table prices the model.
 #[must_use]
 pub fn cost(model: &str, usage: &Usage) -> Option<Cost> {
