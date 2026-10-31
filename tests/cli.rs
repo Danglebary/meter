@@ -402,3 +402,22 @@ mod given_a_transcript_store {
         assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
     }
 }
+
+mod given_a_subagents_meta_file {
+    use super::support::store;
+
+    #[test]
+    fn when_reported_then_the_subagent_groups_under_the_type_it_names() {
+        let scratch = store();
+        scratch.transcript(
+            "-home-p/s1/subagents/agent-x.meta.json",
+            &[r#"{"agentType":"Explore"}"#.to_owned()],
+        );
+
+        let output = scratch.report(&["--format", "json"]);
+
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["subagents"][0]["type"], "Explore");
+        assert_eq!(report["subagents"][0]["agents"], 1);
+    }
+}

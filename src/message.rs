@@ -119,6 +119,16 @@ pub fn transcript_truncated(path: &Path, lines_max: usize) -> String {
     )
 }
 
+/// The line printed on stderr where a subagent's meta file could not be read; the
+/// subagent's type reads as unknown.
+#[must_use]
+pub fn meta_unread(path: &Path, error: &io::Error) -> String {
+    format!(
+        "meter: the subagent meta file at {} could not be read, so its type is unknown: {error}\n",
+        path.display()
+    )
+}
+
 /// The line printed on stderr where the status line's input is not JSON.
 #[must_use]
 pub fn unreadable_input(detail: &str) -> String {

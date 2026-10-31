@@ -12,6 +12,7 @@ mod range;
 mod rebuilds;
 mod render;
 mod sessions;
+mod subagents;
 mod tally;
 mod transcript;
 
@@ -27,6 +28,7 @@ pub use rebuilds::{
 };
 pub use render::{to_json, to_text};
 pub use sessions::{SessionSection, Spread, session_section, spread};
+pub use subagents::{Agents, SubagentSection, agent_type, subagent_section};
 pub use transcript::{
     Call, Fold, Line, Prior, Record, SYNTHETIC_MODEL, TOKENS_PER_FIELD_MAX, Transcript, Usage,
     read_line,
@@ -42,6 +44,8 @@ pub const TRANSCRIPTS_MAX: usize = 100_000;
 pub const LINES_PER_TRANSCRIPT_MAX: usize = 1_000_000;
 /// The longest line a report reads; a longer one counts as malformed.
 pub const LINE_BYTES_MAX: usize = 64 * 1024 * 1024;
+/// The most of a subagent's meta file a report reads; one holds a few hundred bytes.
+pub const META_BYTES_MAX: u64 = 64 * 1024;
 
 /// What a report measured, and each section of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +57,7 @@ pub struct Report {
     pub context: ContextSection,
     pub sessions: SessionSection,
     pub rebuilds: RebuildSection,
+    pub subagents: SubagentSection,
 }
 
 impl Report {
@@ -73,6 +78,7 @@ impl Report {
             context: context_section(transcripts),
             sessions: session_section(transcripts),
             rebuilds: rebuild_section(transcripts),
+            subagents: subagent_section(transcripts),
         }
     }
 }

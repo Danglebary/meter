@@ -13,8 +13,9 @@ use jiff::tz::TimeZone;
 use jiff::{Timestamp, Zoned};
 use meter::cli::{self, Command, Format, ReportArguments};
 use meter::report::{
-    Fold, Gathered, LINE_BYTES_MAX, LINES_PER_TRANSCRIPT_MAX, Line, Location, Range, Report,
-    Selection, TRANSCRIPTS_MAX, Thread, Transcript, project_directory, read_line, to_json, to_text,
+    Fold, Gathered, LINE_BYTES_MAX, LINES_PER_TRANSCRIPT_MAX, Line, Location, META_BYTES_MAX,
+    Range, Report, Selection, TRANSCRIPTS_MAX, Thread, Transcript, agent_type, project_directory,
+    read_line, to_json, to_text,
 };
 use meter::statusline::{
     DayStartInput, Facts, GitState, Input, Snapshot, day_start, parse_porcelain, render, to_ansi,
@@ -456,14 +457,26 @@ fn read_transcript(found: &(Location, PathBuf), range: Range) -> io::Result<Opti
     if !range.may_hold_records_written_until(written) {
         return Ok(None);
     }
+    let fold = fold_transcript(path, range)?;
+    let folded = fold.finish(location.session.clone(), location.thread);
+    let agent_type = match location.thread {
+        Thread::Main => None,
+        Thread::Subagent => read_agent_type(path),
+    };
+    Ok(Some(Transcript {
+        agent_type,
+        ..folded
+    }))
+}
+
+/// The fold of the transcript's lines, at most `LINES_PER_TRANSCRIPT_MAX` of them.
+fn fold_transcript(path: &Path, range: Range) -> io::Result<Fold> {
     let file = File::open(path)?;
     let mut reader = BufReader::with_capacity(TRANSCRIPT_BUFFER_BYTES, file);
     let mut fold = Fold::new(range);
     for _ in 0..LINES_PER_TRANSCRIPT_MAX {
         let line = match next_line(&mut reader)? {
-            Piece::End => {
-                return Ok(Some(fold.finish(location.session.clone(), location.thread)));
-            }
+            Piece::End => return Ok(fold),
             Piece::TooLong => Line::Malformed(""),
             Piece::Text(bytes) => match std::str::from_utf8(&bytes) {
                 Ok(text) => read_line(text),
@@ -476,7 +489,27 @@ fn read_transcript(found: &(Location, PathBuf), range: Range) -> io::Result<Opti
         "{}",
         message::transcript_truncated(path, LINES_PER_TRANSCRIPT_MAX)
     );
-    Ok(Some(fold.finish(location.session.clone(), location.thread)))
+    Ok(fold)
+}
+
+/// The type the subagent's sibling meta file names: none where the file is missing or
+/// names none, and none, named on stderr, where it cannot be read.
+fn read_agent_type(transcript: &Path) -> Option<String> {
+    let meta = transcript.with_extension("meta.json");
+    let file = match File::open(&meta) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            eprint!("{}", message::meta_unread(&meta, &error));
+            return None;
+        }
+    };
+    let mut text = String::new();
+    if let Err(error) = file.take(META_BYTES_MAX).read_to_string(&mut text) {
+        eprint!("{}", message::meta_unread(&meta, &error));
+        return None;
+    }
+    agent_type(&text)
 }
 
 /// One line of a transcript.

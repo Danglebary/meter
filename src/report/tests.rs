@@ -612,6 +612,10 @@ Cache writes by thread and kind
   main       rebuild       $1.00
   subagent   first call    $0.05
   subagent   incremental   $0.00
+
+Subagents by type, with one subagent's mean cost, calls, and context
+            agents    cost   cost each   calls each   starts at   peaks at
+  unknown        1   $0.07       $0.07            2       40.0k      40.0k
 "
         );
     }
@@ -932,6 +936,73 @@ mod given_calls_that_write_the_cache {
         assert_eq!(
             section.rebuilds.keys().copied().collect::<Vec<_>>(),
             [(Thread::Main, Gap::OverAnHour)]
+        );
+    }
+}
+
+mod given_a_subagents_meta_file {
+    use super::*;
+
+    #[test]
+    fn when_it_names_a_type_then_that_type_is_read_and_otherwise_none() {
+        let rows = [
+            (r#"{"agentType":"Explore","spawnDepth":1}"#, Some("Explore")),
+            (r#"{"agentType":""}"#, None),
+            (r#"{"agentType":3}"#, None),
+            ("{}", None),
+            ("not json", None),
+        ];
+
+        for (meta, name) in rows {
+            assert_eq!(agent_type(meta).as_deref(), name, "{meta}");
+        }
+    }
+}
+
+mod given_subagents_to_group {
+    use super::*;
+
+    fn agent(name: Option<&str>, contexts: &[u64]) -> Transcript {
+        Transcript {
+            thread: Thread::Subagent,
+            agent_type: name.map(str::to_owned),
+            ..reading(contexts)
+        }
+    }
+
+    #[test]
+    fn when_grouped_then_a_type_sums_its_agents_and_means_round_half_up() {
+        let transcripts = [
+            agent(Some("Explore"), &[10, 30]),
+            agent(Some("Explore"), &[21]),
+            reading(&[99]),
+        ];
+
+        let section = subagent_section(&transcripts);
+
+        let explore = section.by_type.get(&Some("Explore".to_owned())).unwrap();
+        assert_eq!(
+            *explore,
+            Agents {
+                agents: 2,
+                nanodollars: 12_200,
+                calls: 3,
+                starting_context: 31,
+                peak_context: 51,
+            }
+        );
+        assert_eq!(explore.mean(explore.starting_context), 16);
+        assert_eq!(explore.mean(explore.calls), 2);
+        assert_eq!(section.by_type.len(), 1);
+    }
+
+    #[test]
+    fn when_a_subagents_type_is_unknown_then_it_groups_under_none() {
+        let section = subagent_section(&[agent(None, &[5])]);
+
+        assert_eq!(
+            section.by_type.get(&None).map(|agents| agents.agents),
+            Some(1)
         );
     }
 }

@@ -171,6 +171,9 @@ pub struct Transcript {
     /// The last call of the transcript that began before the range starts, where one did,
     /// so the first of `calls` is not the transcript's first.
     pub before_range: Option<Prior>,
+    /// The subagent's type, as its meta file names it; none for a main thread, or for a
+    /// subagent whose type is unknown.
+    pub agent_type: Option<String>,
 }
 
 /// A call outside the calls measured, kept for when it began and which model it named.
@@ -286,6 +289,7 @@ impl Fold {
             synthetic,
             malformed: self.malformed,
             before_range: self.before_range,
+            agent_type: None,
         }
     }
 }

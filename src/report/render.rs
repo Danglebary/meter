@@ -12,12 +12,14 @@ use super::price::PRICES_AS_OF;
 use super::range::{Range, Thread};
 use super::rebuilds::{Gap, Kind, REBUILD_CONTEXT_FLOOR_TOKENS, RebuildSection};
 use super::sessions::{SessionSection, Spread};
+use super::subagents::{Agents, SubagentSection};
 use super::{Measured, Report};
 
 const NANODOLLARS_PER_CENT: u128 = 10_000_000;
 const CENTS_PER_DOLLAR: u128 = 100;
 const NANODOLLARS_PER_DOLLAR: u128 = 1_000_000_000;
 const TOKENS_PER_TENTH_MILLION: u128 = 100_000;
+const TOKENS_PER_TENTH_THOUSAND: u128 = 100;
 const TENTHS_PER_WHOLE: u128 = 10;
 const PER_MILLE: u128 = 1_000;
 const TOKENS_PER_THOUSAND: u64 = 1_000;
@@ -71,6 +73,7 @@ pub fn to_text(report: &Report, zone: &TimeZone) -> String {
         text.push_str(&context_text(&report.context));
         text.push_str(&sessions_text(&report.sessions));
         text.push_str(&rebuild_text(&report.rebuilds));
+        text.push_str(&subagent_text(&report.subagents));
     }
     text
 }
@@ -404,6 +407,7 @@ pub fn to_json(report: &Report) -> String {
         "context": context_json(&report.context),
         "sessions": sessions_json(&report.sessions),
         "rebuilds": rebuild_json(&report.rebuilds),
+        "subagents": subagent_json(&report.subagents),
     });
     let Ok(text) = serde_json::to_string_pretty(&value) else {
         unreachable!("a JSON value built from strings and numbers serializes")
@@ -540,7 +544,7 @@ fn sessions_text(sessions: &SessionSection) -> String {
     let mut text = match (sessions.starting_context, sessions.calls) {
         (Some(starting), Some(calls)) => {
             let rows = [
-                spread_header(),
+                header_row(&["p10", "median", "p90", "max"]),
                 spread_row("starting context", starting),
                 spread_row("calls", calls),
             ];
@@ -560,10 +564,11 @@ fn sessions_text(sessions: &SessionSection) -> String {
     text
 }
 
-fn spread_header() -> Vec<Cell> {
+/// A header over a table whose first column names its rows and whose others hold figures.
+fn header_row(names: &[&str]) -> Vec<Cell> {
     let mut row = vec![Cell::left(String::new())];
-    for name in ["p10", "median", "p90", "max"] {
-        row.push(Cell::right(name.to_owned()));
+    for name in names {
+        row.push(Cell::right((*name).to_owned()));
     }
     row
 }
@@ -721,4 +726,77 @@ fn rebuild_json(rebuilds: &RebuildSection) -> Value {
         "rebuilds": bands,
         "cache_writes_by_kind": writes,
     })
+}
+
+/// The types most costly first.
+fn type_rows(subagents: &SubagentSection) -> Vec<(&Option<String>, Agents)> {
+    let mut rows: Vec<(&Option<String>, Agents)> = subagents
+        .by_type
+        .iter()
+        .map(|(name, agents)| (name, *agents))
+        .collect();
+    rows.sort_by_key(|row| Reverse(row.1.nanodollars));
+    rows
+}
+
+fn type_name(name: Option<&str>) -> String {
+    name.unwrap_or("unknown").to_owned()
+}
+
+fn subagent_text(subagents: &SubagentSection) -> String {
+    let heading = "Subagents by type, with one subagent's mean cost, calls, and context";
+    let header = header_row(&[
+        "agents",
+        "cost",
+        "cost each",
+        "calls each",
+        "starts at",
+        "peaks at",
+    ]);
+    let mut rows = vec![header];
+    for (name, agents) in type_rows(subagents) {
+        rows.push(vec![
+            Cell::left(type_name(name.as_deref())),
+            Cell::right(grouped(u128::from(agents.agents))),
+            Cell::right(dollars(agents.nanodollars)),
+            Cell::right(dollars(agents.mean(agents.nanodollars))),
+            Cell::right(grouped(agents.mean(agents.calls))),
+            Cell::right(kilotokens(agents.mean(agents.starting_context))),
+            Cell::right(kilotokens(agents.mean(agents.peak_context))),
+        ]);
+    }
+    if subagents.by_type.is_empty() {
+        format!("\n{heading}\n{ROW_INDENT}No subagent ran.\n")
+    } else {
+        section(heading, &rows)
+    }
+}
+
+/// Tokens in thousands to a tenth, rounded half up.
+#[must_use]
+pub fn kilotokens(tokens: u128) -> String {
+    let half_tenth = TOKENS_PER_TENTH_THOUSAND / 2;
+    let rounded = checked(tokens.checked_add(half_tenth));
+    let tenths = checked(rounded.checked_div(TOKENS_PER_TENTH_THOUSAND));
+    let whole = checked(tenths.checked_div(TENTHS_PER_WHOLE));
+    let part = checked(tenths.checked_rem(TENTHS_PER_WHOLE));
+    format!("{}.{part}k", grouped(whole))
+}
+
+fn subagent_json(subagents: &SubagentSection) -> Value {
+    let types: Vec<Value> = type_rows(subagents)
+        .into_iter()
+        .map(|(name, agents)| {
+            json!({
+                "type": name,
+                "agents": agents.agents,
+                "usd": usd(agents.nanodollars),
+                "mean_usd": usd(agents.mean(agents.nanodollars)),
+                "mean_calls": integer(agents.mean(agents.calls)),
+                "mean_starting_context_tokens": integer(agents.mean(agents.starting_context)),
+                "mean_peak_context_tokens": integer(agents.mean(agents.peak_context)),
+            })
+        })
+        .collect();
+    Value::Array(types)
 }
