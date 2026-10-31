@@ -16,6 +16,10 @@ The toolchain is pinned once, in `rust-toolchain.toml`, which both the flake and
 
 CI also builds the flake's package on Linux and macOS. It compiles from the file set `flake.nix` lists, so a file the manifest names outside `src/` joins that set.
 
+## Releases
+
+Raise `version` in `Cargo.toml` and merge to `main`. `.github/workflows/release.yml` publishes a release when the version has no release yet and builds nothing otherwise. Once it publishes, it sends Danglebary/dotfiles an `input-released` repository dispatch carrying the input name, the version, and the released commit, with the `DOTFILES_TOKEN` secret. Archives are named by target alone, so `releases/latest/download/meter-<target>.tar.gz` resolves to the newest build.
+
 ## Shape
 
 `src/lib.rs` is the functional core and does no IO: the argument grammar (`cli`), every message (`report`), the exit codes (`exit_code`), and the status line (`statusline`), which reads Claude Code's input field by field, parses git's porcelain output, counts business days, decides which spend reading starts the day, and renders the lines. `src/main.rs` is the shell: it reads stdin, the clock, the environment, git under a bound, and the day's spend snapshot, hands them to the core as `Facts`, prints, and maps outcomes to exit codes. A new decision goes in the library with a unit test; `main.rs` holds wiring, which `tests/cli.rs` covers against the built binary in scratch directories.
