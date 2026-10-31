@@ -9,6 +9,7 @@ mod context;
 mod cost;
 mod price;
 mod range;
+mod rebuilds;
 mod render;
 mod sessions;
 mod tally;
@@ -20,10 +21,15 @@ pub use context::{
 pub use cost::{Buckets, CostSection, Spend, Ttl, Writes, cost_section};
 pub use price::{Cost, PRICES_AS_OF, cost};
 pub use range::{Location, Range, RangeFault, Selection, Thread, project_directory};
+pub use rebuilds::{
+    Gap, Kind, REBUILD_CONTEXT_FLOOR_TOKENS, RebuildSection, Rebuilds, TTL_1H_MILLISECONDS,
+    TTL_5M_MILLISECONDS, rebuild_section,
+};
 pub use render::{to_json, to_text};
 pub use sessions::{SessionSection, Spread, session_section, spread};
 pub use transcript::{
-    Call, Fold, Line, Record, SYNTHETIC_MODEL, TOKENS_PER_FIELD_MAX, Transcript, Usage, read_line,
+    Call, Fold, Line, Prior, Record, SYNTHETIC_MODEL, TOKENS_PER_FIELD_MAX, Transcript, Usage,
+    read_line,
 };
 
 use jiff::Timestamp;
@@ -46,6 +52,7 @@ pub struct Report {
     pub cost: CostSection,
     pub context: ContextSection,
     pub sessions: SessionSection,
+    pub rebuilds: RebuildSection,
 }
 
 impl Report {
@@ -65,6 +72,7 @@ impl Report {
             cost: cost_section(transcripts),
             context: context_section(transcripts),
             sessions: session_section(transcripts),
+            rebuilds: rebuild_section(transcripts),
         }
     }
 }

@@ -10,6 +10,7 @@ use super::context::{Band, ContextSection, LONG_CONTEXT_FLOOR_TOKENS};
 use super::cost::{CostSection, Spend, Ttl, Writes};
 use super::price::PRICES_AS_OF;
 use super::range::{Range, Thread};
+use super::rebuilds::{Gap, Kind, REBUILD_CONTEXT_FLOOR_TOKENS, RebuildSection};
 use super::sessions::{SessionSection, Spread};
 use super::{Measured, Report};
 
@@ -49,6 +50,10 @@ const UNREADABLE_TRANSCRIPT: Noun = Noun {
     one: "unreadable transcript",
     many: "unreadable transcripts",
 };
+const REBUILD: Noun = Noun {
+    one: "rebuild",
+    many: "rebuilds",
+};
 
 /// The report as text, its times in `zone`, ending in a newline.
 #[must_use]
@@ -65,6 +70,7 @@ pub fn to_text(report: &Report, zone: &TimeZone) -> String {
         text.push_str(&cost_text(&report.cost));
         text.push_str(&context_text(&report.context));
         text.push_str(&sessions_text(&report.sessions));
+        text.push_str(&rebuild_text(&report.rebuilds));
     }
     text
 }
@@ -397,6 +403,7 @@ pub fn to_json(report: &Report) -> String {
         "cost": cost_json(&report.cost),
         "context": context_json(&report.context),
         "sessions": sessions_json(&report.sessions),
+        "rebuilds": rebuild_json(&report.rebuilds),
     });
     let Ok(text) = serde_json::to_string_pretty(&value) else {
         unreachable!("a JSON value built from strings and numbers serializes")
@@ -607,5 +614,111 @@ fn spread_json(spread: Spread) -> Value {
         "median": spread.median,
         "p90": spread.p90,
         "max": spread.max,
+    })
+}
+
+fn rebuild_text(rebuilds: &RebuildSection) -> String {
+    let floor = thousands(REBUILD_CONTEXT_FLOOR_TOKENS);
+    let heading = format!(
+        "Cache rebuilds: calls after their transcript's first writing over half of a context above {floor}"
+    );
+    let rows: Vec<Vec<Cell>> = rebuilds
+        .rebuilds
+        .iter()
+        .map(|((thread, gap), band)| {
+            let switches = grouped(u128::from(band.after_model_switch));
+            vec![
+                Cell::left(thread.name().to_owned()),
+                Cell::left(format!("gap {}", gap_label(*gap))),
+                Cell::left(idle_label(*gap).to_owned()),
+                Cell::right(counted(band.count, &REBUILD)),
+                Cell::right(dollars(band.nanodollars)),
+                Cell::right(format!("{switches} after a model switch")),
+            ]
+        })
+        .collect();
+    let writes: Vec<Vec<Cell>> = rebuilds
+        .writes_by_kind
+        .iter()
+        .map(|((thread, kind), nanodollars)| {
+            vec![
+                Cell::left(thread.name().to_owned()),
+                Cell::left(kind_label(*kind).to_owned()),
+                Cell::right(dollars(*nanodollars)),
+            ]
+        })
+        .collect();
+    let mut text = if rows.is_empty() {
+        format!("\n{heading}\n{ROW_INDENT}No call rebuilt the cache.\n")
+    } else {
+        section(&heading, &rows)
+    };
+    text.push_str(&section("Cache writes by thread and kind", &writes));
+    text
+}
+
+const fn gap_label(gap: Gap) -> &'static str {
+    match gap {
+        Gap::UnderFiveMinutes => "under 5m",
+        Gap::FiveMinutesToAnHour => "5m to 1h",
+        Gap::OverAnHour => "over 1h",
+    }
+}
+
+const fn idle_label(gap: Gap) -> &'static str {
+    match gap {
+        Gap::UnderFiveMinutes => "within both TTLs",
+        Gap::FiveMinutesToAnHour => "idle past the 5m TTL",
+        Gap::OverAnHour => "idle past both TTLs",
+    }
+}
+
+const fn kind_label(kind: Kind) -> &'static str {
+    match kind {
+        Kind::First => "first call",
+        Kind::Rebuild => "rebuild",
+        Kind::Incremental => "incremental",
+    }
+}
+
+/// The TTLs a gap is past, by the name the cost section's cache writes give each.
+fn idle_past(gap: Gap) -> Vec<&'static str> {
+    match gap {
+        Gap::UnderFiveMinutes => Vec::new(),
+        Gap::FiveMinutesToAnHour => vec![Ttl::FiveMinutes.name()],
+        Gap::OverAnHour => vec![Ttl::FiveMinutes.name(), Ttl::OneHour.name()],
+    }
+}
+
+fn rebuild_json(rebuilds: &RebuildSection) -> Value {
+    let bands: Vec<Value> = rebuilds
+        .rebuilds
+        .iter()
+        .map(|((thread, gap), band)| {
+            json!({
+                "thread": thread.name(),
+                "gap": gap_label(*gap),
+                "idle_past_ttls": idle_past(*gap),
+                "rebuilds": band.count,
+                "after_model_switch": band.after_model_switch,
+                "cache_write_usd": usd(band.nanodollars),
+            })
+        })
+        .collect();
+    let writes: Vec<Value> = rebuilds
+        .writes_by_kind
+        .iter()
+        .map(|((thread, kind), nanodollars)| {
+            json!({
+                "thread": thread.name(),
+                "kind": kind_label(*kind),
+                "cache_write_usd": usd(*nanodollars),
+            })
+        })
+        .collect();
+    json!({
+        "context_floor_tokens": REBUILD_CONTEXT_FLOOR_TOKENS,
+        "rebuilds": bands,
+        "cache_writes_by_kind": writes,
     })
 }

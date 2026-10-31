@@ -50,7 +50,7 @@ pub fn session_section(transcripts: &[Transcript]) -> SessionSection {
         let Some(first) = transcript.calls.first() else {
             continue;
         };
-        if transcript.began_before_range {
+        if transcript.before_range.is_some() {
             begun_before_range = count_one(begun_before_range);
             continue;
         }

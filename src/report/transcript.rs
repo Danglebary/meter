@@ -168,9 +168,16 @@ pub struct Transcript {
     /// Calls whose model is `SYNTHETIC_MODEL`, left out of `calls`.
     pub synthetic: u64,
     pub malformed: u64,
-    /// Whether a call of the transcript began before the range starts, so the first of
-    /// `calls` is not the transcript's first.
-    pub began_before_range: bool,
+    /// The last call of the transcript that began before the range starts, where one did,
+    /// so the first of `calls` is not the transcript's first.
+    pub before_range: Option<Prior>,
+}
+
+/// A call outside the calls measured, kept for when it began and which model it named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Prior {
+    pub timestamp: Timestamp,
+    pub model: String,
 }
 
 /// The fold of one transcript's lines into its calls. Records outside the range are
@@ -181,7 +188,7 @@ pub struct Fold {
     calls: Vec<Call>,
     call_index: HashMap<String, usize>,
     malformed: u64,
-    began_before_range: bool,
+    before_range: Option<Prior>,
 }
 
 impl Fold {
@@ -192,7 +199,7 @@ impl Fold {
             calls: Vec::new(),
             call_index: HashMap::new(),
             malformed: 0,
-            began_before_range: false,
+            before_range: None,
         }
     }
 
@@ -212,7 +219,16 @@ impl Fold {
                     self.take_record(record);
                 } else if self.range.precedes(record.timestamp) {
                     if !synthetic {
-                        self.began_before_range = true;
+                        let later = self
+                            .before_range
+                            .as_ref()
+                            .is_none_or(|prior| record.timestamp >= prior.timestamp);
+                        if later {
+                            self.before_range = Some(Prior {
+                                timestamp: record.timestamp,
+                                model: record.model,
+                            });
+                        }
                     }
                 }
             }
@@ -269,7 +285,7 @@ impl Fold {
             calls,
             synthetic,
             malformed: self.malformed,
-            began_before_range: self.began_before_range,
+            before_range: self.before_range,
         }
     }
 }

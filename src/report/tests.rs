@@ -603,6 +603,15 @@ Per main session, over 1 session
                          p10    median       p90       max
   starting context   120,010   120,010   120,010   120,010
   calls                    2         2         2         2
+
+Cache rebuilds: calls after their transcript's first writing over half of a context above 30k
+  main   gap under 5m   within both TTLs   1 rebuild   $1.00   1 after a model switch
+
+Cache writes by thread and kind
+  main       first call    $0.16
+  main       rebuild       $1.00
+  subagent   first call    $0.05
+  subagent   incremental   $0.00
 "
         );
     }
@@ -789,5 +798,140 @@ mod given_main_sessions {
         assert_eq!(section.sessions, 1);
         assert_eq!(section.begun_before_range, 1);
         assert_eq!(section.calls.map(|spread| spread.max), Some(2));
+    }
+}
+
+/// An Opus 5.5 call `id` at `at` sending `cache_read` tokens from the cache and writing
+/// `written` to it at the 1-hour TTL.
+fn writing(id: &'static str, at: &'static str, usage: (u64, u64)) -> Fixture {
+    let (cache_read, written) = usage;
+    Fixture {
+        id,
+        at,
+        model: "claude-opus-5-5",
+        usage: Usage {
+            cache_read,
+            cache_write_1h: written,
+            ..Usage::default()
+        },
+    }
+}
+
+mod given_calls_that_write_the_cache {
+    use super::*;
+
+    fn rebuilds(section: &RebuildSection) -> u64 {
+        section.rebuilds.values().map(|band| band.count).sum()
+    }
+
+    #[test]
+    fn when_a_gap_is_banded_then_each_band_holds_its_upper_edge() {
+        let rows = [
+            (TTL_5M_MILLISECONDS, Gap::UnderFiveMinutes),
+            (
+                TTL_5M_MILLISECONDS.checked_add(1).unwrap(),
+                Gap::FiveMinutesToAnHour,
+            ),
+            (TTL_1H_MILLISECONDS, Gap::FiveMinutesToAnHour),
+            (TTL_1H_MILLISECONDS.checked_add(1).unwrap(), Gap::OverAnHour),
+        ];
+
+        for (milliseconds, gap) in rows {
+            assert_eq!(Gap::of(milliseconds), gap, "{milliseconds}");
+        }
+    }
+
+    #[test]
+    fn when_a_later_call_writes_over_half_of_a_long_context_then_it_is_a_rebuild() {
+        let rows = [
+            ((19_999, 20_001), 1),
+            ((20_000, 20_000), 0),
+            ((0, 30_000), 0),
+            ((0, 30_001), 1),
+        ];
+
+        for (usage, count) in rows {
+            let fixtures = [
+                writing("a", "2026-10-30T10:00:00Z", (0, 50_000)),
+                writing("b", "2026-10-30T10:01:00Z", usage),
+            ];
+
+            let section = rebuild_section(&[folded(&fixtures, Range::default())]);
+
+            assert_eq!(rebuilds(&section), count, "{usage:?}");
+        }
+    }
+
+    #[test]
+    fn when_classified_then_each_writes_cost_falls_to_its_kind() {
+        let fixtures = [
+            writing("a", "2026-10-30T10:00:00Z", (0, 1_000_000)),
+            writing("b", "2026-10-30T10:01:00Z", (1_000_000, 1_000)),
+            writing("c", "2026-10-30T11:30:00Z", (0, 1_001_000)),
+        ];
+
+        let section = rebuild_section(&[folded(&fixtures, Range::default())]);
+
+        let kinds: Vec<(Kind, u128)> = section
+            .writes_by_kind
+            .iter()
+            .map(|((_, kind), nanodollars)| (*kind, *nanodollars))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                (Kind::First, 8_000_000_000),
+                (Kind::Rebuild, 8_008_000_000),
+                (Kind::Incremental, 8_000_000),
+            ]
+        );
+        assert_eq!(
+            section.rebuilds.keys().copied().collect::<Vec<_>>(),
+            [(Thread::Main, Gap::OverAnHour)]
+        );
+    }
+
+    #[test]
+    fn when_a_rebuild_names_another_model_than_the_call_before_then_it_counts_as_a_switch() {
+        let fixtures = [
+            writing("a", "2026-10-30T10:00:00Z", (0, 50_000)),
+            Fixture {
+                model: "claude-fable-5-1",
+                ..writing("b", "2026-10-30T10:01:00Z", (0, 50_000))
+            },
+        ];
+
+        let section = rebuild_section(&[folded(&fixtures, Range::default())]);
+
+        let band = section
+            .rebuilds
+            .get(&(Thread::Main, Gap::UnderFiveMinutes))
+            .unwrap();
+        assert_eq!((band.count, band.after_model_switch), (1, 1));
+    }
+
+    #[test]
+    fn when_a_session_began_before_the_range_then_its_first_call_in_range_follows_the_last_before()
+    {
+        let fixtures = [
+            writing("a", "2026-10-30T10:00:00Z", (0, 50_000)),
+            writing("b", "2026-10-30T11:45:00Z", (0, 50_000)),
+        ];
+        let since = range(Bounds {
+            since: Some(Bound::Instant(instant("2026-10-30T10:30:00Z"))),
+            until: None,
+        });
+
+        let section = rebuild_section(&[folded(&fixtures, since)]);
+
+        assert!(
+            !section
+                .writes_by_kind
+                .contains_key(&(Thread::Main, Kind::First))
+        );
+        assert_eq!(
+            section.rebuilds.keys().copied().collect::<Vec<_>>(),
+            [(Thread::Main, Gap::OverAnHour)]
+        );
     }
 }
