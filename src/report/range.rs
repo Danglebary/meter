@@ -133,26 +133,3 @@ impl Selection {
         if session { project } else { false }
     }
 }
-
-/// The directory name the store keeps a project's transcripts under.
-///
-/// It is the project's absolute path with every character other than an ASCII letter or
-/// digit replaced by a hyphen. Claude Code names the directories so; every directory in
-/// the store on 2026-10-30 matches the `cwd` of its first session's records this way.
-///
-/// # Panics
-///
-/// Where the path is not absolute, which the shell's resolution excludes.
-#[must_use]
-pub fn project_directory(path: &str) -> String {
-    assert!(path.starts_with('/'), "a project path is absolute: {path}");
-    path.chars()
-        .map(|letter| {
-            if letter.is_ascii_alphanumeric() {
-                letter
-            } else {
-                '-'
-            }
-        })
-        .collect()
-}

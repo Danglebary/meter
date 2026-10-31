@@ -11,6 +11,9 @@ mod support {
 
     static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 
+    /// The session every record a case builds names.
+    pub const SESSION: &str = "s1";
+
     pub fn run(arguments: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_meter"))
             .args(arguments)
@@ -92,11 +95,13 @@ mod support {
     fn call(id: &str, at: &str) -> String {
         serde_json::json!({
             "type": "assistant",
+            "sessionId": SESSION,
             "timestamp": at,
             "effort": "xhigh",
             "message": {
                 "id": id,
                 "model": "claude-opus-5-5",
+                "content": [],
                 "usage": { "cache_creation": { "ephemeral_1h_input_tokens": 1_000_000 } }
             }
         })
@@ -109,6 +114,7 @@ mod support {
         let scratch = Scratch::new();
         let user = serde_json::json!({
             "type": "user",
+            "sessionId": SESSION,
             "timestamp": "2026-10-30T09:59:00Z",
             "message": { "content": "hi" }
         });
@@ -433,10 +439,12 @@ mod given_a_context_cap {
     fn reading(id: &str, at: &str, cache_read: u64) -> String {
         serde_json::json!({
             "type": "assistant",
+            "sessionId": SESSION,
             "timestamp": at,
             "message": {
                 "id": id,
                 "model": "claude-opus-5-5",
+                "content": [],
                 "usage": { "cache_read_input_tokens": cache_read }
             }
         })
@@ -444,7 +452,7 @@ mod given_a_context_cap {
     }
 
     fn prompt(at: &str, text: &str) -> String {
-        serde_json::json!({ "type": "user", "timestamp": at, "message": { "content": text } })
+        serde_json::json!({ "type": "user", "sessionId": SESSION, "timestamp": at, "message": { "content": text } })
             .to_string()
     }
 

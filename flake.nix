@@ -70,7 +70,10 @@
               ./src
             ];
           };
-          cargoLock.lockFile = ./Cargo.lock;
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+            outputHashes."claude-code-transcript-0.2.0" = "sha256-VNf5Po60Xmjk0yDggSVh3dVsRiObbGXn826/lnqjVsY=";
+          };
           doCheck = false;
           meta.mainProgram = "meter";
         };

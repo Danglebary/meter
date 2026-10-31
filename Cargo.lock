@@ -9,6 +9,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
 
 [[package]]
+name = "claude-code-transcript"
+version = "0.2.0"
+source = "git+https://github.com/Danglebary/claude-code-transcript?tag=v0.2.0#42c76b0cae3ef75918dcb2199b23651dbaa9af55"
+dependencies = [
+ "jiff",
+ "serde_json",
+]
+
+[[package]]
 name = "defmt"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -115,6 +124,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 name = "meter"
 version = "0.2.0"
 dependencies = [
+ "claude-code-transcript",
  "jiff",
  "serde_json",
 ]
