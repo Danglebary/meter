@@ -1,0 +1,18 @@
+{
+    "ledger": {
+        "kind": "sqlite",
+        "path": ".pirr/store.sqlite"
+    },
+    "repository": {
+        "identity": "8648f39b-b10d-4388-81ca-79b747d1b48f"
+    },
+    "tenant": {
+        "identity": "9a027507-6c48-403a-9b5b-af0fe97bb394"
+    },
+    "pickup": {
+        "gate": {
+            "command": ["just", "check"],
+            "waitSecondsMax": 900
+        }
+    }
+}
