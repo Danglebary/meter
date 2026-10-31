@@ -1,9 +1,9 @@
-//! What a transcript record adds to the context: the tool calls an assistant record makes,
-//! and the tool results, text, and attachments a user or attachment record adds, each
-//! measured in characters. A character is a Unicode scalar value, the unit jq's `length`
-//! counts, which the baseline's extract measured in.
+//! What a transcript record adds to the context: the tool results, text, and attachments a
+//! user or attachment record adds, text and attachments measured in characters as they are
+//! read and a tool result once its call is known. A character is a Unicode scalar value,
+//! the unit jq's `length` counts, which the baseline's extract measured in.
 
-use claude_code_transcript::record::{self, AssistantBlock, Attachment, ResultPart, UserBlock};
+use claude_code_transcript::record::{self, Attachment, ResultPart, ToolResult, UserBlock};
 use serde_json::Value;
 
 /// The characters an image block counts as.
@@ -15,22 +15,11 @@ const BASH_TOOL: &str = "Bash";
 const COMMAND_FIELD: &str = "command";
 const DIRECTORY_CHANGE: &str = "cd ";
 
-/// A tool call an assistant record makes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolUse {
-    pub id: String,
-    pub name: String,
-    /// The program a Bash call runs, where the call is Bash's and names one.
-    pub program: Option<String>,
-}
-
 /// One thing a record adds to the context.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Item {
-    ToolResult {
-        tool_use_id: String,
-        characters: u64,
-    },
+    /// A tool result as the shared parser reads it, measured once it is paired with its call.
+    ToolResult(ToolResult),
     Text {
         class: TextClass,
         characters: u64,
@@ -75,38 +64,14 @@ pub enum Prompt {
     Other,
 }
 
-/// The tool calls among an assistant record's blocks.
-///
-/// # Panics
-///
-/// Where it finds more calls than there are blocks, which no record can cause.
+/// The program a tool call runs, where the call is Bash's and its command names one.
 #[must_use]
-pub fn tool_uses(blocks: &[AssistantBlock]) -> Vec<ToolUse> {
-    let mut tool_uses = Vec::new();
-    for block in blocks {
-        if let AssistantBlock::ToolUse(tool_use) = block {
-            let named = tool_use_of(tool_use);
-            tool_uses.push(named);
-        }
-    }
-    assert!(
-        tool_uses.len() <= blocks.len(),
-        "each tool call is one block"
-    );
-    tool_uses
-}
-
-fn tool_use_of(tool_use: &record::ToolUse) -> ToolUse {
-    let command = tool_use.input.get(COMMAND_FIELD).and_then(Value::as_str);
-    let program = if tool_use.name == BASH_TOOL {
+pub fn bash_program(tool_use: &record::ToolUse) -> Option<String> {
+    if tool_use.name == BASH_TOOL {
+        let command = tool_use.input.get(COMMAND_FIELD).and_then(Value::as_str);
         command.and_then(program)
     } else {
         None
-    };
-    ToolUse {
-        id: tool_use.id.clone(),
-        name: tool_use.name.clone(),
-        program,
     }
 }
 
@@ -116,22 +81,20 @@ fn tool_use_of(tool_use: &record::ToolUse) -> ToolUse {
 ///
 /// Where it finds more items than there are blocks, which no record can cause.
 #[must_use]
-pub fn user_items(blocks: &[UserBlock]) -> Vec<Item> {
+pub fn user_items(blocks: Vec<UserBlock>) -> Vec<Item> {
+    let block_count = blocks.len();
     let mut items = Vec::new();
     for block in blocks {
         match block {
             UserBlock::Text { text, class } => items.push(Item::Text {
-                class: text_class(class),
-                characters: characters(text),
+                class: text_class(&class),
+                characters: characters(&text),
             }),
-            UserBlock::ToolResult(result) => items.push(Item::ToolResult {
-                tool_use_id: result.tool_use_id.clone(),
-                characters: content_characters(&result.parts),
-            }),
+            UserBlock::ToolResult(result) => items.push(Item::ToolResult(result)),
             UserBlock::Image | UserBlock::Other => {}
         }
     }
-    assert!(items.len() <= blocks.len(), "each item is one block");
+    assert!(items.len() <= block_count, "each item is one block");
     items
 }
 

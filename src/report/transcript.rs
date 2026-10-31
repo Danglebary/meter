@@ -1,14 +1,18 @@
 //! One transcript, read a line at a time: each line is read through the shared transcript
-//! parser, the records of one call fold into that call, and what user and attachment
-//! records add to the context is placed among the calls that carry it.
+//! parser, the records of one call fold into that call, each tool result is paired with
+//! its call through the parser's pairing, and what user and attachment records add to the
+//! context is placed among the calls that carry it.
 
 use std::collections::HashMap;
 
+use claude_code_transcript::calls::{self, Awaited, Completed, Paired, Pairing};
 use claude_code_transcript::record::{self, Assistant, Attachment, TOKENS_PER_FIELD_MAX, User};
 use jiff::Timestamp;
 
 use super::carry::{Carriage, Carried, Placed, carriage};
-use super::content::{Item, Prompt, ToolUse, attachment_item, prompt, tool_uses, user_items};
+use super::content::{
+    Item, Prompt, attachment_item, bash_program, content_characters, prompt, user_items,
+};
 use super::range::{Range, Thread};
 
 /// The model Claude Code names on the assistant records it writes itself, such as a notice
@@ -58,13 +62,16 @@ pub struct Record {
     pub model: String,
     pub effort: Option<String>,
     pub usage: Usage,
-    pub tool_uses: Vec<ToolUse>,
 }
 
 /// What one line of a transcript holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Line {
-    Record(Record),
+    /// An assistant record carrying usage, beside the tool calls it makes.
+    Record {
+        record: Record,
+        tool_calls: Vec<calls::Call>,
+    },
     /// What a user or attachment record adds to the context.
     Added {
         timestamp: Timestamp,
@@ -73,9 +80,7 @@ pub enum Line {
         prompt: Option<Prompt>,
     },
     /// A compaction boundary, where Claude Code replaced the context with a summary.
-    Compaction {
-        timestamp: Timestamp,
-    },
+    Compaction { timestamp: Timestamp },
     /// Any line that is neither.
     Other,
     /// A record whose field fails its check; the JSON pointer names the field, or the root
@@ -92,8 +97,8 @@ pub enum Line {
 pub fn read_line(text: &str) -> Line {
     let read = record::read_line(text);
     match read {
-        record::Line::Assistant(assistant) => Line::Record(record_of(assistant)),
-        record::Line::User(user) => user_line(&user),
+        record::Line::Assistant(assistant) => assistant_line(assistant),
+        record::Line::User(user) => user_line(user),
         record::Line::Attachment(attachment) => attachment_line(&attachment),
         record::Line::Compaction(compaction) => Line::Compaction {
             timestamp: compaction.envelope.timestamp,
@@ -103,17 +108,17 @@ pub fn read_line(text: &str) -> Line {
     }
 }
 
-fn record_of(assistant: Assistant) -> Record {
-    let tool_uses = tool_uses(&assistant.blocks);
+fn assistant_line(assistant: Assistant) -> Line {
+    let tool_calls = calls::calls_of(&assistant);
     let usage = usage_of(assistant.usage);
-    Record {
+    let record = Record {
         message_id: assistant.message_id,
         timestamp: assistant.envelope.timestamp,
         model: assistant.model,
         effort: assistant.effort,
         usage,
-        tool_uses,
-    }
+    };
+    Line::Record { record, tool_calls }
 }
 
 /// The tokens a call reports, field for field.
@@ -138,15 +143,16 @@ const fn usage_of(usage: record::Usage) -> Usage {
 
 /// A user record's items and the turn it opens, placed at its time; a record adding
 /// nothing is no record the report reads.
-fn user_line(user: &User) -> Line {
-    let items = user_items(&user.blocks);
+fn user_line(user: User) -> Line {
     let opened = prompt(&user.blocks);
+    let timestamp = user.envelope.timestamp;
+    let items = user_items(user.blocks);
     if items.is_empty() {
         assert!(opened.is_none(), "a prompt adds its text to the context");
         return Line::Other;
     }
     Line::Added {
-        timestamp: user.envelope.timestamp,
+        timestamp,
         items,
         prompt: opened,
     }
@@ -159,6 +165,18 @@ fn attachment_line(attachment: &Attachment) -> Line {
         items: vec![item],
         prompt: None,
     }
+}
+
+/// What a result paired with its call carries: the call's tool and a Bash call's program,
+/// and the result's characters.
+fn result_carried(paired: Paired) -> (Carried, u64) {
+    let program = bash_program(&paired.call.tool_use);
+    let characters = content_characters(&paired.result.parts);
+    let carried = Carried::ToolResult {
+        tool: paired.call.tool_use.name,
+        program,
+    };
+    (carried, characters)
 }
 
 /// One call to a model: the time, model, and effort of its first record, and the usage of
@@ -227,8 +245,8 @@ pub struct Fold {
     call_index: HashMap<String, usize>,
     malformed: u64,
     before_range: Option<Prior>,
-    /// The name, and a Bash call's program, of each tool call, by its id.
-    tool_names: HashMap<String, (String, Option<String>)>,
+    /// The tool calls awaiting their results.
+    pairing: Pairing,
     placed: Vec<Placed>,
     /// The transcript's first prompt, and when its second began.
     first_prompt: Option<(Timestamp, Prompt)>,
@@ -245,7 +263,7 @@ impl Fold {
             call_index: HashMap::new(),
             malformed: 0,
             before_range: None,
-            tool_names: HashMap::new(),
+            pairing: Pairing::new(),
             placed: Vec::new(),
             first_prompt: None,
             second_prompt: None,
@@ -263,10 +281,9 @@ impl Fold {
                 };
                 self.malformed = malformed;
             }
-            Line::Record(record) => {
-                for tool_use in &record.tool_uses {
-                    let named = (tool_use.name.clone(), tool_use.program.clone());
-                    self.tool_names.insert(tool_use.id.clone(), named);
+            Line::Record { record, tool_calls } => {
+                for tool_call in tool_calls {
+                    self.await_call(tool_call);
                 }
                 if self.range.holds(record.timestamp) {
                     self.take_record(record);
@@ -282,9 +299,20 @@ impl Fold {
                 if let Some(prompt) = prompt {
                     self.take_prompt(timestamp, prompt);
                 }
-                if self.range.holds(timestamp) {
-                    for item in items {
-                        self.place(item);
+                // A result outside the range still completes its call, so the calls
+                // awaiting are those whose results have not arrived.
+                let held = self.range.holds(timestamp);
+                for item in items {
+                    let (carried, characters) = match item {
+                        Item::ToolResult(result) => match self.pairing.complete(result) {
+                            Completed::Paired(paired) => result_carried(paired),
+                            // A result completing no awaited call is left out.
+                            Completed::Unawaited(_) => continue,
+                        },
+                        Item::Text { class, characters } => (Carried::Text(class), characters),
+                    };
+                    if held {
+                        self.place(carried, characters);
                     }
                 }
             }
@@ -319,25 +347,18 @@ impl Fold {
         }
     }
 
-    /// Places an item after the calls taken so far; a tool result whose call the
-    /// transcript never named is left out.
-    fn place(&mut self, item: Item) {
-        let (carried, characters) = match item {
-            Item::ToolResult {
-                tool_use_id,
-                characters,
-            } => {
-                let Some((tool, program)) = self.tool_names.get(&tool_use_id) else {
-                    return;
-                };
-                let carried = Carried::ToolResult {
-                    tool: tool.clone(),
-                    program: program.clone(),
-                };
-                (carried, characters)
-            }
-            Item::Text { class, characters } => (Carried::Text(class), characters),
-        };
+    /// Holds a tool call until its result arrives.
+    fn await_call(&mut self, tool_call: calls::Call) {
+        let awaited = self.pairing.await_call(tool_call);
+        match awaited {
+            // A copy of an awaited call leaves the first to take the result, and the
+            // result of a call past the pairing's bound completes no call.
+            Awaited::Held | Awaited::Duplicate(_) | Awaited::Full(_) => {}
+        }
+    }
+
+    /// Places what an item carries after the calls taken so far.
+    fn place(&mut self, carried: Carried, characters: u64) {
         self.placed.push(Placed {
             item: carried,
             characters,
