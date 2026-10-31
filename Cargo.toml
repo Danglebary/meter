@@ -6,7 +6,7 @@ edition = "2024"
 # pins rather than the floor a dependency declares.
 rust-version = "1.99"
 description = "Renders Claude Code's status line and measures Claude Code's token usage and cost over its transcripts"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/Danglebary/meter"
 
 [lints.rust]
