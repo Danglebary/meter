@@ -1,6 +1,6 @@
 # meter
 
-A Rust binary with two subcommands on one core: `meter statusline` renders Claude Code's status line from the JSON Claude Code sends on stdin, and `meter report` measures Claude Code's token usage and cost over its transcripts, for one session or a range. `README.md` says what it is for; `meter --help`, generated from `src/report.rs`, is the grammar.
+A Rust binary with two subcommands on one core: `meter statusline` renders Claude Code's status line from the JSON Claude Code sends on stdin, and `meter report` measures Claude Code's token usage and cost over its transcripts, for one session or a range. `README.md` says what it is for; `meter --help`, generated from `src/message.rs`, is the grammar.
 
 The engineering style guide at `~/.claude/CLAUDE.md` governs. This file states only what is specific to this repository.
 
@@ -22,7 +22,7 @@ Raise `version` in `Cargo.toml` and merge to `main`. `.github/workflows/release.
 
 ## Shape
 
-`src/lib.rs` is the functional core and does no IO: the argument grammar (`cli`), every message (`report`), the exit codes (`exit_code`), and the status line (`statusline`), which reads Claude Code's input field by field, parses git's porcelain output, counts business days, decides which spend reading starts the day, and renders the lines. `src/main.rs` is the shell: it reads stdin, the clock, the environment, git under a bound, and the day's spend snapshot, hands them to the core as `Facts`, prints, and maps outcomes to exit codes. A new decision goes in the library with a unit test; `main.rs` holds wiring, which `tests/cli.rs` covers against the built binary in scratch directories.
+`src/lib.rs` is the functional core and does no IO: the argument grammar (`cli`), every message (`message`), the exit codes (`exit_code`), the status line (`statusline`), which reads Claude Code's input field by field, parses git's porcelain output, counts business days, decides which spend reading starts the day, and renders the lines, and the report (`report`), which places the range in time, selects transcripts by where they sit in the store, reads each line field by field, folds a call's records into the call, prices it, and renders the report as text or JSON. `src/main.rs` is the shell: it reads stdin, the clock, the environment, git under a bound, the day's spend snapshot, and the transcript store under `~/.claude/projects`, hands them to the core, prints, and maps outcomes to exit codes. A new decision goes in the library with a unit test; `main.rs` holds wiring, which `tests/cli.rs` covers against the built binary in scratch directories.
 
 The lint table denies `unwrap`, `expect`, `panic!`, indexing, slicing, string slicing, `as` casts, and unchecked arithmetic. A programmer error crashes through `assert!` or `unreachable!` with a message; arithmetic goes through `checked_*` with a `let ... else { unreachable!(..) }`, and slicing through `.get(..)`.
 
