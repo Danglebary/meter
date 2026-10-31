@@ -18,7 +18,7 @@ CI also builds the flake's package on Linux and macOS. It compiles from the file
 
 ## Shape
 
-`src/lib.rs` is the functional core and does no IO: the argument grammar (`cli`), every message (`report`), and the exit codes (`exit_code`). `src/main.rs` is the shell: it reads the arguments, prints, and maps outcomes to exit codes. A new decision goes in the library with a unit test; `main.rs` holds wiring, which `tests/cli.rs` covers against the built binary.
+`src/lib.rs` is the functional core and does no IO: the argument grammar (`cli`), every message (`report`), the exit codes (`exit_code`), and the status line (`statusline`), which reads Claude Code's input field by field, parses git's porcelain output, counts business days, decides which spend reading starts the day, and renders the lines. `src/main.rs` is the shell: it reads stdin, the clock, the environment, git under a bound, and the day's spend snapshot, hands them to the core as `Facts`, prints, and maps outcomes to exit codes. A new decision goes in the library with a unit test; `main.rs` holds wiring, which `tests/cli.rs` covers against the built binary in scratch directories.
 
 The lint table denies `unwrap`, `expect`, `panic!`, indexing, slicing, string slicing, `as` casts, and unchecked arithmetic. A programmer error crashes through `assert!` or `unreachable!` with a message; arithmetic goes through `checked_*` with a `let ... else { unreachable!(..) }`, and slicing through `.get(..)`.
 

@@ -6,3 +6,4 @@
 pub mod cli;
 pub mod exit_code;
 pub mod report;
+pub mod statusline;

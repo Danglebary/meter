@@ -2,7 +2,13 @@
 
 meter renders Claude Code's status line and measures Claude Code's token usage and cost, from one core. `meter statusline` reads the JSON Claude Code sends a status line on stdin and prints the line: the context in tokens, whether the prompt cache is warm or cold, and the account's usage or spend against its limit. `meter report` measures usage and cost over Claude Code's transcripts, for one session or a range, the same way every time.
 
-Neither subcommand is built yet; the binary answers `--help` and `--version`.
+`meter statusline` is built; `meter report` is not yet. Point Claude Code's status line at it in `settings.json`:
+
+```json
+"statusLine": { "type": "command", "command": "meter statusline", "refreshInterval": 60 }
+```
+
+It prints three lines: the directory, branch, and pull request; the model, effort, context in tokens, and whether the prompt cache is warm, with the minutes left, or cold; and the 7-day usage on a subscription limited by usage, or the session's, day's, and period's spend behind a gateway with a spend limit. A field Claude Code leaves out or sends malformed blanks its own segment and nothing else. Behind a spend limit, the day's first reading is kept in `$XDG_STATE_HOME/meter/spend-day.json`, `~/.local/state` by default.
 
 ## Development
 
