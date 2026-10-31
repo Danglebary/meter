@@ -4,6 +4,7 @@
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Help,
+    Statusline,
     Version,
 }
 
@@ -25,9 +26,12 @@ pub fn parse_arguments(arguments: &[String]) -> Result<Command, UsageFault> {
         [] => Err(UsageFault::MissingCommand),
         ["--help" | "-h"] => Ok(Command::Help),
         ["--version" | "-V"] => Ok(Command::Version),
-        ["--help" | "-h" | "--version" | "-V", surplus, ..] => {
-            Err(UsageFault::UnknownArgument((*surplus).to_owned()))
-        }
+        ["statusline"] => Ok(Command::Statusline),
+        [
+            "--help" | "-h" | "--version" | "-V" | "statusline",
+            surplus,
+            ..,
+        ] => Err(UsageFault::UnknownArgument((*surplus).to_owned())),
         [first, ..] => Err(UsageFault::UnknownArgument((*first).to_owned())),
     }
 }

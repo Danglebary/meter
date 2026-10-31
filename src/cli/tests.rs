@@ -26,6 +26,23 @@ mod given_a_flag_alone {
     }
 }
 
+mod given_the_statusline_command {
+    use super::*;
+
+    #[test]
+    fn when_parsed_alone_then_it_names_the_status_line() {
+        assert_eq!(parsed(&["statusline"]), Ok(Command::Statusline));
+    }
+
+    #[test]
+    fn when_parsed_with_a_surplus_word_then_the_word_is_refused_by_name() {
+        assert_eq!(
+            parsed(&["statusline", "--verbose"]),
+            Err(UsageFault::UnknownArgument("--verbose".to_owned()))
+        );
+    }
+}
+
 mod given_no_argument {
     use super::*;
 

@@ -61,3 +61,7 @@ lto = "thin"
 codegen-units = 1
 panic = "abort"
 overflow-checks = true
+
+[dependencies]
+jiff = "0.2.38"
+serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
