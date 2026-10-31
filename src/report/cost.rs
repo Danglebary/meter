@@ -112,7 +112,7 @@ pub fn cost_section(transcripts: &[Transcript]) -> CostSection {
     let mut section = CostSection::default();
     for transcript in transcripts {
         for call in &transcript.calls {
-            let Some(priced) = cost(&call.model, &call.usage) else {
+            let Some(priced) = cost(call, &call.usage) else {
                 let calls = section.unpriced.entry(call.model.clone()).or_default();
                 *calls = count_one(*calls);
                 continue;

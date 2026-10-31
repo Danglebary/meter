@@ -1,15 +1,23 @@
 //! List prices, and what a call costs at them.
 //!
-//! The table holds the claude-api skill bundled with Claude Code 2.1.300: the model table
-//! in its `SKILL.md`, cached 2026-10-06, with its Claude Haiku 5.5 note, and cache writes
-//! from § Economics of `shared/prompt-caching.md` at 1.25x input for the 5-minute TTL and
-//! 2x for the 1-hour TTL. A price is held in nanodollars per token, a thousand times the
-//! dollars per million tokens the table lists, so every price is a whole number.
+//! The table holds the rates of the pricing page,
+//! <https://platform.claude.com/docs/en/about-claude/pricing> — checked 2026-10-30, with
+//! cache writes at 1.25x input for the 5-minute TTL and 2x for the 1-hour TTL. A rate the
+//! page has changed keeps the rate before it beside the day the change took effect, which
+//! the API release notes give,
+//! <https://platform.claude.com/docs/en/release-notes/overview> — checked 2026-10-30. The
+//! notes date a change by its day alone, so a change takes effect from the start of that
+//! day in UTC. A price is held in nanodollars per token, a thousand times the dollars per
+//! million tokens the table lists, so every price is a whole number.
 
-use super::transcript::Usage;
+use super::transcript::{Call, Usage};
+use jiff::civil::Date;
+use jiff::tz::Offset;
 
-/// The date the price table was cached.
-pub const PRICES_AS_OF: &str = "2026-10-06";
+/// The date the price table was last checked against the pricing page.
+pub const PRICES_AS_OF: &str = "2026-10-30";
+/// The day Claude Sonnet 5.5's cache reads fell from 0.1x input to 0.05x.
+const SONNET_5_5_CACHE_READ_CUT: Date = Date::constant(2026, 10, 7);
 /// The context Claude Haiku 5.5 prices at its lower rates; a longer one takes the higher.
 const HAIKU_5_5_LOWER_RATE_CONTEXT_MAX: u64 = 100_000;
 /// A 5-minute cache write costs 1.25x input.
@@ -38,9 +46,11 @@ struct Rates {
     cache_read: u64,
 }
 
-/// The prices of `model` for a call sending `context` tokens, where the table holds it.
-const fn rates(model: &str, context: u64) -> Option<Rates> {
-    let rates = match model.as_bytes() {
+/// The prices standing for `call`'s model on its day in UTC, for a call sending the context
+/// `usage` reports, where the table holds the model.
+fn rates(call: &Call, usage: &Usage) -> Option<Rates> {
+    let context = usage.context();
+    let rates = match call.model.as_bytes() {
         b"claude-opus-5-5" => Rates {
             input: 4_000,
             output: 20_000,
@@ -51,11 +61,22 @@ const fn rates(model: &str, context: u64) -> Option<Rates> {
             output: 50_000,
             cache_read: 250,
         },
-        b"claude-sonnet-5-5" => Rates {
-            input: 2_000,
-            output: 10_000,
-            cache_read: 200,
-        },
+        b"claude-sonnet-5-5" => {
+            let day = Offset::UTC.to_datetime(call.timestamp).date();
+            if day < SONNET_5_5_CACHE_READ_CUT {
+                Rates {
+                    input: 2_000,
+                    output: 10_000,
+                    cache_read: 200,
+                }
+            } else {
+                Rates {
+                    input: 2_000,
+                    output: 10_000,
+                    cache_read: 100,
+                }
+            }
+        }
         b"claude-haiku-5-5" => {
             if context <= HAIKU_5_5_LOWER_RATE_CONTEXT_MAX {
                 Rates {
@@ -83,6 +104,14 @@ const fn rates(model: &str, context: u64) -> Option<Rates> {
         },
         _ => return None,
     };
+    assert!(
+        rates.cache_read < rates.input,
+        "a cache read costs less than input: {rates:?}"
+    );
+    assert!(
+        rates.input < rates.output,
+        "input costs less than output: {rates:?}"
+    );
     Some(rates)
 }
 
@@ -121,18 +150,19 @@ impl Cost {
     }
 }
 
-/// The cache-read rate of `model` for a call sending `context` tokens, in nanodollars per
-/// token, where the table prices the model.
+/// The cache-read rate standing for `call`, in nanodollars per token, where the table
+/// prices its model.
 #[must_use]
-pub fn cache_read_rate(model: &str, context: u64) -> Option<u64> {
-    let rates = rates(model, context)?;
+pub fn cache_read_rate(call: &Call) -> Option<u64> {
+    let rates = rates(call, &call.usage)?;
     Some(rates.cache_read)
 }
 
-/// What a call by `model` reporting `usage` cost, where the table prices the model.
+/// What `call` costs when it reports `usage`, at the rates standing for its model on its
+/// day, where the table prices the model.
 #[must_use]
-pub fn cost(model: &str, usage: &Usage) -> Option<Cost> {
-    let rates = rates(model, usage.context())?;
+pub fn cost(call: &Call, usage: &Usage) -> Option<Cost> {
+    let rates = rates(call, usage)?;
     Some(Cost {
         input: priced(usage.input, rates.input),
         cache_read: priced(usage.cache_read, rates.cache_read),

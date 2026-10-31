@@ -135,7 +135,7 @@ fn pickup(transcripts: &[Transcript]) -> Option<Pickup> {
         };
         let mut nanodollars: u64 = 0;
         for call in &calls {
-            let priced = cost(&call.model, &call.usage).unwrap_or_default();
+            let priced = cost(call, &call.usage).unwrap_or_default();
             nanodollars = plus(nanodollars, priced.total());
         }
         costs.push(nanodollars);
@@ -244,8 +244,8 @@ fn simulate(transcript: &Transcript, limits: Limits) -> Priced {
         }
         let taken = Step { dropped, ..step }.taken();
         let usage = reduced(&call.usage, taken);
-        let as_run = cost(&call.model, &call.usage).unwrap_or_default();
-        let simulated = cost(&call.model, &usage).unwrap_or_default();
+        let as_run = cost(call, &call.usage).unwrap_or_default();
+        let simulated = cost(call, &usage).unwrap_or_default();
         run.as_run = add(run.as_run, input_side(&as_run));
         run.simulated = add(run.simulated, input_side(&simulated));
         previous = Some(step.context);

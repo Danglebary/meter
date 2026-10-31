@@ -53,7 +53,7 @@ pub fn context_section(transcripts: &[Transcript]) -> ContextSection {
     for transcript in main {
         for call in &transcript.calls {
             let context = call.usage.context();
-            let priced = cost(&call.model, &call.usage).unwrap_or_default();
+            let priced = cost(call, &call.usage).unwrap_or_default();
             let input_side = [priced.input, priced.cache_read, priced.cache_write()]
                 .into_iter()
                 .fold(0_u128, |sum, part| add(sum, u128::from(part)));

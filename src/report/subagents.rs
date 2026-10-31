@@ -74,7 +74,7 @@ pub fn subagent_section(transcripts: &[Transcript]) -> SubagentSection {
         let mut nanodollars: u128 = 0;
         let mut peak: u64 = 0;
         for call in &transcript.calls {
-            let priced = cost(&call.model, &call.usage).unwrap_or_default();
+            let priced = cost(call, &call.usage).unwrap_or_default();
             nanodollars = add(nanodollars, u128::from(priced.total()));
             peak = peak.max(call.usage.context());
         }

@@ -330,7 +330,7 @@ mod given_a_transcript_store {
             [
                 "Measured 3 sessions and 1 subagent: 4 calls, 2026-10-29 10:00 to 2026-10-30 11:00.",
                 "",
-                "Cost at list price, as of 2026-10-06: $32.00",
+                "Cost at list price, as of 2026-10-30: $32.00",
                 "",
             ]
         );

@@ -151,7 +151,7 @@ fn rates_after(calls: &[Call]) -> Vec<u128> {
     let mut sum: u128 = 0;
     sums.push(sum);
     for call in calls.iter().rev() {
-        let rate = cache_read_rate(&call.model, call.usage.context()).unwrap_or(0);
+        let rate = cache_read_rate(call).unwrap_or(0);
         sum = add(sum, u128::from(rate));
         sums.push(sum);
     }

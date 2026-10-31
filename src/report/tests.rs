@@ -396,6 +396,16 @@ mod given_a_calls_records {
 mod given_a_price_table {
     use super::*;
 
+    /// A call to `model` reporting `usage`, made after every rate change the table holds.
+    fn call(model: &str, usage: Usage) -> Call {
+        Call {
+            timestamp: instant("2026-10-30T12:00:00Z"),
+            model: model.to_owned(),
+            effort: None,
+            usage,
+        }
+    }
+
     #[test]
     fn when_a_call_is_priced_then_each_bucket_takes_its_rate_and_writes_their_multiple() {
         let usage = Usage {
@@ -406,9 +416,10 @@ mod given_a_price_table {
             output: 1_000_000,
             thinking: 0,
         };
+        let opus = call("claude-opus-5-5", usage);
 
         assert_eq!(
-            cost("claude-opus-5-5", &usage),
+            cost(&opus, &opus.usage),
             Some(Cost {
                 input: 4_000_000_000,
                 cache_read: 200_000_000,
@@ -431,8 +442,11 @@ mod given_a_price_table {
             ..short
         };
 
-        let short_cost = cost("claude-haiku-5-5", &short).unwrap();
-        let long_cost = cost("claude-haiku-5-5", &long).unwrap();
+        let short_call = call("claude-haiku-5-5", short);
+        let long_call = call("claude-haiku-5-5", long);
+
+        let short_cost = cost(&short_call, &short_call.usage).unwrap();
+        let long_cost = cost(&long_call, &long_call.usage).unwrap();
 
         assert_eq!((short_cost.input, short_cost.output), (10_000_000, 500));
         assert_eq!((long_cost.input, long_cost.output), (50_000_500, 2_500));
@@ -440,7 +454,32 @@ mod given_a_price_table {
 
     #[test]
     fn when_the_table_lacks_the_model_then_the_call_is_unpriced() {
-        assert_eq!(cost("claude-next", &Usage::default()), None);
+        let unknown = call("claude-next", Usage::default());
+
+        assert_eq!(cost(&unknown, &unknown.usage), None);
+    }
+
+    #[test]
+    fn when_a_rate_changed_then_each_call_takes_the_rate_standing_on_its_day_in_utc() {
+        let usage = Usage {
+            cache_read: 1_000_000,
+            ..Usage::default()
+        };
+        let cases = [
+            ("2026-10-06T23:59:59Z", 200_000_000),
+            ("2026-10-07T00:00:00Z", 100_000_000),
+            ("2026-10-06T20:00:00-07:00", 100_000_000),
+        ];
+
+        for (at, cache_read) in cases {
+            let sonnet = Call {
+                timestamp: instant(at),
+                ..call("claude-sonnet-5-5", usage)
+            };
+            let priced = cost(&sonnet, &sonnet.usage).unwrap();
+
+            assert_eq!(priced.cache_read, cache_read, "a call made at {at}");
+        }
     }
 }
 
@@ -573,7 +612,7 @@ mod given_a_report_to_render {
 Measured 1 session and 1 subagent: 4 calls, 2026-10-30 03:00 to 2026-10-30 03:05.
 Left out: 1 synthetic record.
 
-Cost at list price, as of 2026-10-06: $1.37
+Cost at list price, as of 2026-10-30: $1.37
 
 By bucket
   cache write   $1.21   88.6%

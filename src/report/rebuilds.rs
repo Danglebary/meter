@@ -95,9 +95,8 @@ pub fn rebuild_section(transcripts: &[Transcript]) -> RebuildSection {
             model: prior.model.as_str(),
         });
         for call in &transcript.calls {
-            let written = cost(&call.model, &call.usage)
-                .unwrap_or_default()
-                .cache_write();
+            let priced = cost(call, &call.usage).unwrap_or_default();
+            let written = priced.cache_write();
             let kind = previous.map_or(Kind::First, |_| kind(&call.usage));
             let kind_key = (transcript.thread, kind);
             let by_kind = section.writes_by_kind.entry(kind_key).or_default();
