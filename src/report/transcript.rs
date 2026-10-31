@@ -168,6 +168,9 @@ pub struct Transcript {
     /// Calls whose model is `SYNTHETIC_MODEL`, left out of `calls`.
     pub synthetic: u64,
     pub malformed: u64,
+    /// Whether a call of the transcript began before the range starts, so the first of
+    /// `calls` is not the transcript's first.
+    pub began_before_range: bool,
 }
 
 /// The fold of one transcript's lines into its calls. Records outside the range are
@@ -178,6 +181,7 @@ pub struct Fold {
     calls: Vec<Call>,
     call_index: HashMap<String, usize>,
     malformed: u64,
+    began_before_range: bool,
 }
 
 impl Fold {
@@ -188,6 +192,7 @@ impl Fold {
             calls: Vec::new(),
             call_index: HashMap::new(),
             malformed: 0,
+            began_before_range: false,
         }
     }
 
@@ -202,8 +207,13 @@ impl Fold {
                 self.malformed = malformed;
             }
             Line::Record(record) => {
+                let synthetic = record.model == SYNTHETIC_MODEL;
                 if self.range.holds(record.timestamp) {
                     self.take_record(record);
+                } else if self.range.precedes(record.timestamp) {
+                    if !synthetic {
+                        self.began_before_range = true;
+                    }
                 }
             }
         }
@@ -232,7 +242,7 @@ impl Fold {
         );
     }
 
-    /// The transcript's calls, its synthetic calls counted apart.
+    /// The transcript's calls in the order they began, its synthetic calls counted apart.
     ///
     /// # Panics
     ///
@@ -240,7 +250,7 @@ impl Fold {
     #[must_use]
     pub fn finish(self, session: String, thread: Thread) -> Transcript {
         let total = self.calls.len();
-        let (synthetic, calls): (Vec<Call>, Vec<Call>) = self
+        let (synthetic, mut calls): (Vec<Call>, Vec<Call>) = self
             .calls
             .into_iter()
             .partition(|call| call.model == SYNTHETIC_MODEL);
@@ -249,6 +259,7 @@ impl Fold {
             Some(total),
             "the partition keeps every call"
         );
+        calls.sort_by_key(|call| call.timestamp);
         let Ok(synthetic) = u64::try_from(synthetic.len()) else {
             unreachable!("a count of calls fits a u64")
         };
@@ -258,6 +269,7 @@ impl Fold {
             calls,
             synthetic,
             malformed: self.malformed,
+            began_before_range: self.began_before_range,
         }
     }
 }

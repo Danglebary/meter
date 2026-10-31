@@ -73,6 +73,12 @@ impl Range {
     pub fn may_hold_records_written_until(&self, modified: Timestamp) -> bool {
         self.start.is_none_or(|start| modified >= start)
     }
+
+    /// Whether the instant falls before the range starts.
+    #[must_use]
+    pub fn precedes(&self, at: Timestamp) -> bool {
+        self.start.is_some_and(|start| at < start)
+    }
 }
 
 fn midnight(date: Date, zone: &TimeZone) -> Result<Timestamp, RangeFault> {

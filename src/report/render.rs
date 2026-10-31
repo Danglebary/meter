@@ -6,9 +6,11 @@ use jiff::tz::TimeZone;
 use serde_json::{Map, Number, Value, json};
 use std::cmp::Reverse;
 
+use super::context::{Band, ContextSection, LONG_CONTEXT_FLOOR_TOKENS};
 use super::cost::{CostSection, Spend, Ttl, Writes};
 use super::price::PRICES_AS_OF;
 use super::range::{Range, Thread};
+use super::sessions::{SessionSection, Spread};
 use super::{Measured, Report};
 
 const NANODOLLARS_PER_CENT: u128 = 10_000_000;
@@ -17,6 +19,7 @@ const NANODOLLARS_PER_DOLLAR: u128 = 1_000_000_000;
 const TOKENS_PER_TENTH_MILLION: u128 = 100_000;
 const TENTHS_PER_WHOLE: u128 = 10;
 const PER_MILLE: u128 = 1_000;
+const TOKENS_PER_THOUSAND: u64 = 1_000;
 const THOUSANDS_GROUP: usize = 3;
 const COLUMN_GAP: &str = "   ";
 const ROW_INDENT: &str = "  ";
@@ -60,6 +63,8 @@ pub fn to_text(report: &Report, zone: &TimeZone) -> String {
     }
     if report.measured.calls > 0 {
         text.push_str(&cost_text(&report.cost));
+        text.push_str(&context_text(&report.context));
+        text.push_str(&sessions_text(&report.sessions));
     }
     text
 }
@@ -390,6 +395,8 @@ pub fn to_json(report: &Report) -> String {
         },
         "measured": measured_json(&report.measured),
         "cost": cost_json(&report.cost),
+        "context": context_json(&report.context),
+        "sessions": sessions_json(&report.sessions),
     });
     let Ok(text) = serde_json::to_string_pretty(&value) else {
         unreachable!("a JSON value built from strings and numbers serializes")
@@ -466,4 +473,139 @@ fn integer(count: u128) -> Value {
         unreachable!("a sum of bounded token counts fits a u64: {count}")
     };
     Value::from(count)
+}
+
+fn context_text(context: &ContextSection) -> String {
+    let rows: Vec<Vec<Cell>> = context
+        .bands
+        .iter()
+        .map(|band| {
+            vec![
+                Cell::left(band_label(band)),
+                Cell::right(calls(band.calls)),
+                Cell::right(dollars(band.input_side)),
+            ]
+        })
+        .collect();
+    let long = share(Portion {
+        part: context.long_context_cache_read,
+        whole: context.cache_read,
+    });
+    let floor = thousands(LONG_CONTEXT_FLOOR_TOKENS);
+    let mut text = section(
+        "Main-thread calls by context, and their input-side cost",
+        &rows,
+    );
+    let long_line = format!(
+        "{ROW_INDENT}Calls over {floor} carry {long} of the main thread's cache-read cost.\n"
+    );
+    text.push_str(&long_line);
+    text
+}
+
+fn band_label(band: &Band) -> String {
+    let from = thousands(band.from_tokens);
+    match band.to_tokens {
+        None => format!("{from} and over"),
+        Some(to) if band.from_tokens == 0 => format!("under {}", thousands(to)),
+        Some(to) => format!("{from} to {}", thousands(to)),
+    }
+}
+
+/// Tokens in whole thousands, as a band edge reads.
+fn thousands(tokens: u64) -> String {
+    assert_eq!(
+        tokens.checked_rem(TOKENS_PER_THOUSAND),
+        Some(0),
+        "a band edge is a whole thousand: {tokens}"
+    );
+    let Some(whole) = tokens.checked_div(TOKENS_PER_THOUSAND) else {
+        unreachable!("the divisor is a nonzero constant")
+    };
+    format!("{whole}k")
+}
+
+fn sessions_text(sessions: &SessionSection) -> String {
+    let heading = format!(
+        "Per main session, over {}",
+        counted(sessions.sessions, &SESSION)
+    );
+    let mut text = match (sessions.starting_context, sessions.calls) {
+        (Some(starting), Some(calls)) => {
+            let rows = [
+                spread_header(),
+                spread_row("starting context", starting),
+                spread_row("calls", calls),
+            ];
+            section(&heading, &rows)
+        }
+        (None, None) => format!("\n{heading}\n"),
+        (Some(_), None) | (None, Some(_)) => {
+            unreachable!("every session has both a start and a length")
+        }
+    };
+    if sessions.begun_before_range > 0 {
+        let left_out = counted(sessions.begun_before_range, &SESSION);
+        let left_out_line =
+            format!("{ROW_INDENT}Left out of these figures: {left_out} begun before the range.\n");
+        text.push_str(&left_out_line);
+    }
+    text
+}
+
+fn spread_header() -> Vec<Cell> {
+    let mut row = vec![Cell::left(String::new())];
+    for name in ["p10", "median", "p90", "max"] {
+        row.push(Cell::right(name.to_owned()));
+    }
+    row
+}
+
+fn spread_row(name: &str, spread: Spread) -> Vec<Cell> {
+    let values = [spread.p10, spread.median, spread.p90, spread.max];
+    let mut row = vec![Cell::left(name.to_owned())];
+    for value in values {
+        row.push(Cell::right(grouped(u128::from(value))));
+    }
+    row
+}
+
+fn context_json(context: &ContextSection) -> Value {
+    let bands: Vec<Value> = context
+        .bands
+        .iter()
+        .map(|band| {
+            json!({
+                "from_tokens": band.from_tokens,
+                "to_tokens": band.to_tokens,
+                "calls": band.calls,
+                "input_side_usd": usd(band.input_side),
+            })
+        })
+        .collect();
+    json!({
+        "thread": Thread::Main.name(),
+        "bands": bands,
+        "cache_read_usd": usd(context.cache_read),
+        "long_context_floor_tokens": LONG_CONTEXT_FLOOR_TOKENS,
+        "long_context_cache_read_usd": usd(context.long_context_cache_read),
+    })
+}
+
+fn sessions_json(sessions: &SessionSection) -> Value {
+    json!({
+        "sessions": sessions.sessions,
+        "begun_before_range": sessions.begun_before_range,
+        "starting_context_tokens": sessions.starting_context.map(spread_json),
+        "calls": sessions.calls.map(spread_json),
+    })
+}
+
+fn spread_json(spread: Spread) -> Value {
+    json!({
+        "p10": spread.p10,
+        "median": spread.median,
+        "p90": spread.p90,
+        "max": spread.max,
+    })
 }

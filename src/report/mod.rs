@@ -2,24 +2,32 @@
 //!
 //! The shell finds the transcripts the selection names and hands this module their lines;
 //! each line is read field by field, the records of one call fold into that call, and the
-//! calls are measured and rendered as text or JSON. Nothing here reads a file, the clock,
-//! or the environment, so every rule is tested against values.
+//! calls are measured section by section and rendered as text or JSON. Nothing here reads
+//! a file, the clock, or the environment, so every rule is tested against values.
 
+mod context;
 mod cost;
 mod price;
 mod range;
 mod render;
+mod sessions;
+mod tally;
 mod transcript;
 
+pub use context::{
+    Band, CONTEXT_BAND_EDGES_TOKENS, ContextSection, LONG_CONTEXT_FLOOR_TOKENS, context_section,
+};
 pub use cost::{Buckets, CostSection, Spend, Ttl, Writes, cost_section};
 pub use price::{Cost, PRICES_AS_OF, cost};
 pub use range::{Location, Range, RangeFault, Selection, Thread, project_directory};
 pub use render::{to_json, to_text};
+pub use sessions::{SessionSection, Spread, session_section, spread};
 pub use transcript::{
     Call, Fold, Line, Record, SYNTHETIC_MODEL, TOKENS_PER_FIELD_MAX, Transcript, Usage, read_line,
 };
 
 use jiff::Timestamp;
+use tally::plus;
 
 /// The most transcripts a report reads; the store holds about a hundredth of this.
 pub const TRANSCRIPTS_MAX: usize = 100_000;
@@ -29,13 +37,15 @@ pub const LINES_PER_TRANSCRIPT_MAX: usize = 1_000_000;
 /// The longest line a report reads; a longer one counts as malformed.
 pub const LINE_BYTES_MAX: usize = 64 * 1024 * 1024;
 
-/// What a report measured, and the cost section of it.
+/// What a report measured, and each section of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Report {
     pub range: Range,
     pub selection: Selection,
     pub measured: Measured,
     pub cost: CostSection,
+    pub context: ContextSection,
+    pub sessions: SessionSection,
 }
 
 impl Report {
@@ -53,6 +63,8 @@ impl Report {
             selection: selection.clone(),
             measured: Measured::of(transcripts, unread),
             cost: cost_section(transcripts),
+            context: context_section(transcripts),
+            sessions: session_section(transcripts),
         }
     }
 }
@@ -84,6 +96,11 @@ pub struct Measured {
 }
 
 impl Measured {
+    /// What `transcripts` hold, with `unread` counting the transcripts not read.
+    ///
+    /// # Panics
+    ///
+    /// Where a transcript's calls do not run in the order they began.
     #[must_use]
     pub fn of(transcripts: &[Transcript], unread: u64) -> Self {
         let mut measured = Self {
@@ -91,41 +108,39 @@ impl Measured {
             ..Self::default()
         };
         for transcript in transcripts {
-            measured.synthetic = sum(measured.synthetic, transcript.synthetic);
-            measured.malformed = sum(measured.malformed, transcript.malformed);
-            if transcript.calls.is_empty() {
+            measured.synthetic = plus(measured.synthetic, transcript.synthetic);
+            measured.malformed = plus(measured.malformed, transcript.malformed);
+            let (Some(first), Some(last)) = (transcript.calls.first(), transcript.calls.last())
+            else {
                 continue;
-            }
+            };
             match transcript.thread {
-                Thread::Main => measured.sessions = sum(measured.sessions, 1),
-                Thread::Subagent => measured.subagents = sum(measured.subagents, 1),
+                Thread::Main => measured.sessions = plus(measured.sessions, 1),
+                Thread::Subagent => measured.subagents = plus(measured.subagents, 1),
             }
             let Ok(calls) = u64::try_from(transcript.calls.len()) else {
                 unreachable!("a count of calls fits a u64")
             };
-            measured.calls = sum(measured.calls, calls);
-            for call in &transcript.calls {
-                let earliest = measured
-                    .first_call
-                    .is_none_or(|first| call.timestamp < first);
-                let latest = measured.last_call.is_none_or(|last| call.timestamp > last);
-                if earliest {
-                    measured.first_call = Some(call.timestamp);
-                }
-                if latest {
-                    measured.last_call = Some(call.timestamp);
-                }
+            measured.calls = plus(measured.calls, calls);
+            assert!(
+                first.timestamp <= last.timestamp,
+                "a transcript's calls run in the order they began"
+            );
+            let earliest = measured
+                .first_call
+                .is_none_or(|known| first.timestamp < known);
+            let latest = measured
+                .last_call
+                .is_none_or(|known| last.timestamp > known);
+            if earliest {
+                measured.first_call = Some(first.timestamp);
+            }
+            if latest {
+                measured.last_call = Some(last.timestamp);
             }
         }
         measured
     }
-}
-
-fn sum(count: u64, more: u64) -> u64 {
-    let Some(total) = count.checked_add(more) else {
-        unreachable!("counts of bounded transcripts' lines fit a u64")
-    };
-    total
 }
 
 #[cfg(test)]

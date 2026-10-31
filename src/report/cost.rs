@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 
 use super::price::{Cost, cost};
 use super::range::Thread;
+use super::tally::{add, count_one};
 use super::transcript::Transcript;
 
 /// The cost section. Every amount is in nanodollars, summed in a u128 so no count of calls
@@ -149,18 +150,4 @@ pub fn cost_section(transcripts: &[Transcript]) -> CostSection {
     }
     section.cache_writes.retain(|_, writes| writes.tokens > 0);
     section
-}
-
-fn add(sum: u128, part: u128) -> u128 {
-    let Some(total) = sum.checked_add(part) else {
-        unreachable!("bounded calls of bounded cost sum within a u128")
-    };
-    total
-}
-
-fn count_one(count: u64) -> u64 {
-    let Some(next) = count.checked_add(1) else {
-        unreachable!("a count of calls fits a u64")
-    };
-    next
 }

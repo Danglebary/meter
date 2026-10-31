@@ -590,6 +590,19 @@ Cache writes by thread and TTL
 
 Unpriced, left out of every amount
   claude-next   1 call
+
+Main-thread calls by context, and their input-side cost
+  under 50k       0 calls   $0.00
+  50k to 100k      1 call   $1.00
+  100k to 200k     1 call   $0.18
+  200k to 400k    0 calls   $0.00
+  400k and over   0 calls   $0.00
+  Calls over 300k carry 0.0% of the main thread's cache-read cost.
+
+Per main session, over 1 session
+                         p10    median       p90       max
+  starting context   120,010   120,010   120,010   120,010
+  calls                    2         2         2         2
 "
         );
     }
@@ -608,10 +621,173 @@ Unpriced, left out of every amount
             json!([{ "model": "claude-next", "calls": 1 }])
         );
         assert_eq!(value["measured"]["calls"], json!(4));
+        assert_eq!(value["context"]["bands"][1]["calls"], json!(1));
+        assert_eq!(value["sessions"]["calls"]["median"], json!(2));
     }
 
     #[test]
     fn when_nothing_is_measured_then_the_text_says_so_and_holds_no_cost() {
         assert_eq!(to_text(&report(&[]), &zone()), "Measured no calls.\n");
+    }
+}
+
+/// A main thread of Opus 5.5 calls reading `contexts` tokens from the cache, a minute apart
+/// from 10:00, for at most six calls.
+fn reading(contexts: &[u64]) -> Transcript {
+    const IDS: [&str; 6] = ["a", "b", "c", "d", "e", "f"];
+    const TIMES: [&str; 6] = [
+        "2026-10-30T10:00:00Z",
+        "2026-10-30T10:01:00Z",
+        "2026-10-30T10:02:00Z",
+        "2026-10-30T10:03:00Z",
+        "2026-10-30T10:04:00Z",
+        "2026-10-30T10:05:00Z",
+    ];
+    assert!(
+        contexts.len() <= IDS.len(),
+        "a reading holds at most six calls"
+    );
+    let fixtures: Vec<Fixture> = contexts
+        .iter()
+        .zip(IDS.into_iter().zip(TIMES))
+        .map(|(&context, (id, at))| Fixture {
+            id,
+            at,
+            model: "claude-opus-5-5",
+            usage: Usage {
+                cache_read: context,
+                ..Usage::default()
+            },
+        })
+        .collect();
+    folded(&fixtures, Range::default())
+}
+
+mod given_main_thread_calls_to_band {
+    use super::*;
+
+    #[test]
+    fn when_banded_then_each_call_falls_below_the_first_edge_above_its_context() {
+        let transcripts = [
+            reading(&[49_999, 50_000, 100_000, 399_999, 400_000]),
+            Transcript {
+                thread: Thread::Subagent,
+                ..reading(&[10])
+            },
+        ];
+
+        let section = context_section(&transcripts);
+
+        let calls: Vec<u64> = section.bands.iter().map(|band| band.calls).collect();
+        assert_eq!(calls, [1, 1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn when_the_cache_read_share_is_taken_then_calls_above_the_floor_alone_are_long() {
+        let floor = LONG_CONTEXT_FLOOR_TOKENS;
+        let above = floor.checked_add(1).unwrap();
+
+        let section = context_section(&[reading(&[floor, above])]);
+
+        assert_eq!(section.cache_read, 120_000_200);
+        assert_eq!(section.long_context_cache_read, 60_000_200);
+    }
+}
+
+mod given_values_to_spread {
+    use super::*;
+
+    #[test]
+    fn when_spread_then_each_percentile_is_the_value_at_its_floored_position() {
+        let values: Vec<u64> = (1..=20).rev().collect();
+
+        assert_eq!(
+            spread(&values),
+            Some(Spread {
+                p10: 2,
+                median: 10,
+                p90: 18,
+                max: 20,
+            })
+        );
+    }
+
+    #[test]
+    fn when_a_floored_position_is_zero_then_the_percentile_takes_the_first_value() {
+        assert_eq!(
+            spread(&[7, 5]),
+            Some(Spread {
+                p10: 5,
+                median: 5,
+                p90: 5,
+                max: 7,
+            })
+        );
+    }
+
+    #[test]
+    fn when_there_are_no_values_then_there_is_no_spread() {
+        assert_eq!(spread(&[]), None);
+    }
+}
+
+mod given_main_sessions {
+    use super::*;
+
+    #[test]
+    fn when_a_sessions_calls_are_written_out_of_order_then_it_starts_at_its_earliest() {
+        let fixtures = [
+            Fixture {
+                id: "b",
+                at: "2026-10-30T10:05:00Z",
+                model: "claude-opus-5-5",
+                usage: Usage {
+                    cache_read: 9,
+                    ..Usage::default()
+                },
+            },
+            Fixture {
+                id: "a",
+                at: "2026-10-30T10:00:00Z",
+                model: "claude-opus-5-5",
+                usage: Usage {
+                    cache_read: 7,
+                    ..Usage::default()
+                },
+            },
+        ];
+
+        let section = session_section(&[folded(&fixtures, Range::default())]);
+
+        assert_eq!(section.starting_context.map(|spread| spread.max), Some(7));
+    }
+
+    #[test]
+    fn when_a_session_began_before_the_range_then_it_is_left_out_of_the_figures_and_counted() {
+        let since = range(Bounds {
+            since: Some(Bound::Instant(instant("2026-10-30T10:02:30Z"))),
+            until: None,
+        });
+        let fixtures = [
+            Fixture {
+                id: "a",
+                at: "2026-10-30T10:00:00Z",
+                model: "claude-opus-5-5",
+                usage: Usage::default(),
+            },
+            Fixture {
+                id: "b",
+                at: "2026-10-30T10:03:00Z",
+                model: "claude-opus-5-5",
+                usage: Usage::default(),
+            },
+        ];
+        let transcripts = [folded(&fixtures, since), reading(&[5, 6])];
+
+        let section = session_section(&transcripts);
+
+        assert_eq!(section.sessions, 1);
+        assert_eq!(section.begun_before_range, 1);
+        assert_eq!(section.calls.map(|spread| spread.max), Some(2));
     }
 }
