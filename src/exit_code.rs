@@ -7,3 +7,5 @@ pub const USAGE: u8 = 2;
 pub const UNREADABLE_INPUT: u8 = 3;
 /// Writing the status line to stdout failed.
 pub const OUTPUT: u8 = 4;
+/// The transcript store could not be found or listed; nothing was printed.
+pub const UNREADABLE_STORE: u8 = 5;

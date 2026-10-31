@@ -71,3 +71,111 @@ mod given_an_unknown_argument {
         );
     }
 }
+
+mod given_the_report_command {
+    use super::*;
+
+    fn words(texts: &[&str]) -> Vec<String> {
+        texts.iter().map(|text| (*text).to_owned()).collect()
+    }
+
+    #[test]
+    fn when_parsed_alone_then_it_measures_every_transcript_as_text() {
+        assert_eq!(
+            parsed(&["report"]),
+            Ok(Command::Report(ReportArguments::default()))
+        );
+    }
+
+    #[test]
+    fn when_parsed_with_every_flag_then_each_value_is_kept() {
+        let arguments = [
+            "report",
+            "--since",
+            "2026-10-01",
+            "--until",
+            "2026-10-30T22:35:23.003Z",
+            "--session",
+            "abc-1",
+            "--session",
+            "def-2",
+            "--project",
+            "/home/admin/projects/meter",
+            "--format",
+            "json",
+        ];
+
+        assert_eq!(
+            parsed(&arguments),
+            Ok(Command::Report(ReportArguments {
+                bounds: Bounds {
+                    since: Some(Bound::Date(jiff::civil::date(2026, 10, 1))),
+                    until: Some(Bound::Instant("2026-10-30T22:35:23.003Z".parse().unwrap())),
+                },
+                sessions: words(&["abc-1", "def-2"]),
+                projects: words(&["/home/admin/projects/meter"]),
+                format: Format::Json,
+            }))
+        );
+    }
+
+    #[test]
+    fn when_a_flag_taken_once_is_repeated_then_it_is_refused_by_name() {
+        let rows = [
+            (
+                ["--since", "2026-10-01", "--since", "2026-10-02"],
+                Flag::Since,
+            ),
+            (
+                ["--until", "2026-10-01", "--until", "2026-10-02"],
+                Flag::Until,
+            ),
+            (["--format", "text", "--format", "json"], Flag::Format),
+        ];
+
+        for (flags, flag) in rows {
+            let arguments: Vec<&str> = std::iter::once("report").chain(flags).collect();
+
+            assert_eq!(
+                parsed(&arguments),
+                Err(UsageFault::RepeatedFlag(flag)),
+                "{flags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn when_a_flag_lacks_its_value_then_it_is_refused_naming_the_flag() {
+        assert_eq!(
+            parsed(&["report", "--session"]),
+            Err(UsageFault::MissingValue(Flag::Session))
+        );
+    }
+
+    #[test]
+    fn when_a_value_fails_its_flags_check_then_it_is_refused_with_the_value() {
+        let rows = [
+            (Flag::Since, "yesterday"),
+            (Flag::Until, "2026-10-30T22:35:23"),
+            (Flag::Session, "../escape"),
+            (Flag::Project, ""),
+            (Flag::Format, "yaml"),
+        ];
+
+        for (flag, value) in rows {
+            assert_eq!(
+                parsed(&["report", flag.spelling(), value]),
+                Err(UsageFault::InvalidValue(flag, value.to_owned())),
+                "{flag:?} {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn when_given_an_unknown_flag_then_it_is_refused_by_name() {
+        assert_eq!(
+            parsed(&["report", "--cap", "200000"]),
+            Err(UsageFault::UnknownArgument("--cap".to_owned()))
+        );
+    }
+}

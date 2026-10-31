@@ -67,6 +67,70 @@ mod support {
                 .unwrap();
             assert!(status.success(), "git {arguments:?}");
         }
+
+        /// Writes `lines` as the transcript at `relative` under the scratch home's
+        /// transcript store.
+        pub fn transcript(&self, relative: &str, lines: &[String]) {
+            let path = self.root.join(".claude/projects").join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, lines.join("\n")).unwrap();
+        }
+
+        /// Runs `meter report` with `arguments`, the scratch root as its home, in UTC.
+        pub fn report(&self, arguments: &[&str]) -> Output {
+            Command::new(env!("CARGO_BIN_EXE_meter"))
+                .arg("report")
+                .args(arguments)
+                .env("HOME", &self.root)
+                .env("TZ", "UTC")
+                .output()
+                .unwrap()
+        }
+    }
+
+    /// An Opus 5.5 call at `at` writing 1,000,000 tokens to the 1-hour cache, $8.
+    fn call(id: &str, at: &str) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "timestamp": at,
+            "effort": "xhigh",
+            "message": {
+                "id": id,
+                "model": "claude-opus-5-5",
+                "usage": { "cache_creation": { "ephemeral_1h_input_tokens": 1_000_000 } }
+            }
+        })
+        .to_string()
+    }
+
+    /// A scratch home whose store holds two sessions in project `/home/p`, the first with a
+    /// subagent, and one in `/home/q`.
+    pub fn store() -> Scratch {
+        let scratch = Scratch::new();
+        let user = serde_json::json!({ "type": "user", "message": { "content": "hi" } });
+        scratch.transcript(
+            "-home-p/s1.jsonl",
+            &[user.to_string(), call("a", "2026-10-30T10:00:00Z")],
+        );
+        scratch.transcript(
+            "-home-p/s1/subagents/agent-x.jsonl",
+            &[call("b", "2026-10-30T10:01:00Z")],
+        );
+        scratch.transcript("-home-p/s2.jsonl", &[call("c", "2026-10-29T10:00:00Z")]);
+        scratch.transcript("-home-q/s3.jsonl", &[call("d", "2026-10-30T11:00:00Z")]);
+        scratch
+    }
+
+    /// The `measured` object of a JSON report the run printed, having succeeded.
+    pub fn measured(output: &Output) -> serde_json::Value {
+        assert_eq!(
+            output.status.code(),
+            Some(i32::from(meter::exit_code::SUCCESS)),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        report["measured"].clone()
     }
 
     impl Drop for Scratch {
@@ -243,5 +307,98 @@ mod given_a_spend_limit {
                 .starts_with("$21.45 | $10 / $"),
             "{lines}"
         );
+    }
+}
+
+mod given_a_transcript_store {
+    use super::support::{Scratch, measured, store};
+
+    #[test]
+    fn when_reported_then_every_transcript_is_measured_and_costed() {
+        let scratch = store();
+
+        let output = scratch.report(&[]);
+
+        let text = String::from_utf8(output.stdout).unwrap();
+        let lines: Vec<&str> = text.lines().take(4).collect();
+        assert_eq!(
+            lines,
+            [
+                "Measured 3 sessions and 1 subagent: 4 calls, 2026-10-29 10:00 to 2026-10-30 11:00.",
+                "",
+                "Cost at list price, as of 2026-10-06: $32.00",
+                "",
+            ]
+        );
+    }
+
+    #[test]
+    fn when_a_session_is_named_then_its_subagents_are_measured_with_it_alone() {
+        let scratch = store();
+
+        let output = scratch.report(&["--session", "s1", "--format", "json"]);
+
+        let measured = measured(&output);
+        assert_eq!(measured["sessions"], 1);
+        assert_eq!(measured["subagents"], 1);
+        assert_eq!(measured["calls"], 2);
+    }
+
+    #[test]
+    fn when_a_project_is_named_then_its_sessions_alone_are_measured() {
+        let scratch = store();
+
+        let output = scratch.report(&["--project", "/home/q", "--format", "json"]);
+
+        assert_eq!(measured(&output)["calls"], 1);
+    }
+
+    #[test]
+    fn when_a_range_is_given_then_records_outside_it_are_left_out() {
+        let scratch = store();
+
+        let output = scratch.report(&[
+            "--since",
+            "2026-10-30",
+            "--until",
+            "2026-10-30T10:30:00Z",
+            "--format",
+            "json",
+        ]);
+
+        let measured = measured(&output);
+        assert_eq!(measured["calls"], 2);
+        assert_eq!(measured["first_call"], "2026-10-30T10:00:00Z");
+    }
+
+    #[test]
+    fn when_the_home_holds_no_store_then_it_exits_with_the_store_code_naming_the_store() {
+        let scratch = Scratch::new();
+
+        let output = scratch.report(&[]);
+
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(i32::from(meter::exit_code::UNREADABLE_STORE))
+        );
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
+        assert!(
+            stderr.starts_with("meter: the transcript store at "),
+            "{stderr}"
+        );
+    }
+
+    #[test]
+    fn when_since_falls_after_until_then_it_exits_with_the_usage_code() {
+        let scratch = store();
+
+        let output = scratch.report(&["--since", "2026-10-30", "--until", "2026-10-29"]);
+
+        assert_eq!(
+            output.status.code(),
+            Some(i32::from(meter::exit_code::USAGE))
+        );
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
     }
 }
