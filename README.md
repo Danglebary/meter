@@ -14,6 +14,8 @@ It prints three lines: the directory, branch, and pull request; the model, effor
 
 `just check` is the gate: the format check, clippy with every warning denied, and the tests. The toolchain is the one `rust-toolchain.toml` pins; the flake's shell provides it, and the recipes enter that shell themselves.
 
+A release is cut by raising `version` in `Cargo.toml` and merging to `main`; the release workflow builds and publishes it.
+
 ## License
 
 Licensed under either of the [Apache License, Version 2.0](LICENSE-APACHE) or the [MIT license](LICENSE-MIT), at your option.
