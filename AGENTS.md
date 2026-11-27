@@ -14,7 +14,7 @@ meter records its decisions in the pirr ledger, in a stream of its own in the ma
 
 The toolchain is pinned once, in `rust-toolchain.toml`, which both the flake and CI's rustup read.
 
-CI also builds the flake's package on Linux and macOS. It compiles from the file set `flake.nix` lists, so a file the manifest names outside `src/` joins that set.
+CI also builds the flake's package on Linux. It compiles from the file set `flake.nix` lists, so a file the manifest names outside `src/` joins that set.
 
 Transcripts are read through `claude-code-transcript`, a git dependency in `Cargo.toml` pinned to a release tag. Moving the pin moves its `outputHashes` entry in `flake.nix`: the first `nix build` after the move fails and prints the hash to write.
 
